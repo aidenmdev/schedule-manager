@@ -1,0 +1,13 @@
+﻿.venv/
+__pycache__/
+*.pyc
+token.json
+credentials.json
+state.json
+config.json
+gui_prefs.json
+app.log
+backups/
+.cache/
+*.bak
+*.tmp

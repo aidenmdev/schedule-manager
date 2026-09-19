@@ -1,0 +1,42 @@
+{
+  "_comment": "Copy this file to config.json and edit the values below.",
+  "gmail_query": "from:dominos.com",
+  "gmail_search_window_days": 120,
+  "calendar_id": "primary",
+  "event_title": "Dominos",
+  "timezone": "America/Los_Angeles",
+  "event_color_id": {
+    "Insider": null,
+    "Manager": "6"
+  },
+  "reminder_minutes_before": [
+    60,
+    30
+  ],
+  "summary_email_to": "you@example.com",
+  "summary_email_subject_prefix": "Weekly Schedule",
+  "store_name": "Domino's",
+  "_comment_report": "Settings below control the full weekly report across ALL your calendar events (Dominos + Staples + school + everything else), not just Dominos.",
+  "report_calendars": [
+    "primary"
+  ],
+  "job_match": {
+    "Dominos": "dominos",
+    "Staples": "staples, work"
+  },
+  "job_wages": {
+    "Dominos": 16.66,
+    "Staples": 0
+  },
+  "school_course_code_regex": "^[A-Za-z]{2,4}\\s?-?\\d{2,4}[A-Za-z]?\\b",
+  "school_extra_titles": [],
+  "school_exceptions": [],
+  "conflict_thresholds_minutes": {
+    "very_close": 30,
+    "close": 60
+  },
+  "break_ok_categories": [
+    "Dominos"
+  ],
+  "display_name": ""
+}
