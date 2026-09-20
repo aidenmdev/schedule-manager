@@ -1076,6 +1076,34 @@ class PayPeriodTests(unittest.TestCase):
             self.assertIsNone(core.pay_period_bounds(date(2026, 9, 18), sched))
         self.assertIsNone(core.next_payday({"type": "off"}))
 
+    def test_each_job_has_its_own_schedule(self):
+        weekly = {"type": "weekly", "start": "2026-09-14", "delay_days": 3}
+        cfg = make_config(job_pay={"Dominos": self.BI, "Staples": weekly}, pay_schedule={"type": "off"})
+        self.assertEqual(core.job_pay_schedule(cfg, "Staples"), weekly)
+        self.assertEqual(core.scheduled_jobs(cfg), ["Dominos", "Staples"])
+        paydays = core.upcoming_paydays(cfg, date(2026, 9, 18))
+        self.assertEqual([(j, d) for j, d, _ in paydays], [("Staples", date(2026, 9, 23)), ("Dominos", date(2026, 9, 25))])
+
+    def test_the_older_single_schedule_still_applies_to_jobs_without_their_own(self):
+        cfg = make_config(pay_schedule=self.BI, job_pay={"Staples": {"type": "off"}})
+        self.assertEqual(core.scheduled_jobs(cfg), ["Dominos"])          # Staples opted out, Dominos inherits
+        self.assertEqual(core.job_pay_schedule(cfg, "Dominos"), self.BI)
+        self.assertEqual(core.upcoming_paydays(make_config(), date(2026, 9, 18)), [])
+
+    def test_pay_periods_follow_the_chosen_job(self):
+        cal = FakeCalendar()
+        cal.add_raw("Dominos", datetime(2026, 9, 21, 16, 0), datetime(2026, 9, 21, 20, 0))
+        cal.add_raw("Staples", datetime(2026, 9, 22, 9, 0), datetime(2026, 9, 22, 14, 0))
+        cfg = make_config(job_pay={"Dominos": self.BI, "Staples": {"type": "weekly", "start": "2026-09-14", "delay_days": 0}})
+        dom = core.compute_pay_periods(cal, cfg, count=2, today=date(2026, 9, 23), job="Dominos")
+        sta = core.compute_pay_periods(cal, cfg, count=2, today=date(2026, 9, 23), job="Staples")
+        self.assertEqual((dom[-1]["week_end"] - dom[-1]["week_start"]).days, 13)
+        self.assertEqual((sta[-1]["week_end"] - sta[-1]["week_start"]).days, 6)
+        self.assertEqual(dom[-1]["hours"], 4.0)
+        self.assertEqual(sta[-1]["hours"], 5.0)
+        default = core.compute_pay_periods(cal, cfg, count=2, today=date(2026, 9, 23))
+        self.assertEqual(default[-1]["job"], "Dominos")
+
     def test_next_payday(self):
         # period 9/7-9/20 pays 9/25; period 9/21-10/4 pays 10/9
         self.assertEqual(core.next_payday(self.BI, date(2026, 9, 18)), (date(2026, 9, 25), (date(2026, 9, 7), date(2026, 9, 20))))

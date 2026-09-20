@@ -264,7 +264,8 @@ def load_config() -> dict:
     cfg.setdefault("min_rest_hours", 8)
     cfg.setdefault("weekly_hours_goal", 0)
     cfg.setdefault("email_html", True)
-    cfg.setdefault("pay_schedule", {"type": "off", "start": "", "delay_days": 0})
+    cfg.setdefault("pay_schedule", {"type": "off", "start": "", "delay_days": 0})  # the older single schedule
+    cfg.setdefault("job_pay", {})  # {job: {"type", "start", "delay_days"}}: each job is paid on its own schedule
     return cfg
 
 
@@ -1126,6 +1127,27 @@ def payday_for(period_end: date, sched: dict) -> date:
     return period_end + timedelta(days=int(sched.get("delay_days") or 0))
 
 
+def job_pay_schedule(config: dict, job: str) -> dict:
+    """The pay schedule for one job. A schedule saved before schedules were per job applies to jobs that have none of their own."""
+    own = (config.get("job_pay") or {}).get(job)
+    return own if own is not None else (config.get("pay_schedule") or {})
+
+
+def scheduled_jobs(config: dict) -> list:
+    """Jobs that have a pay schedule, in the order they appear in settings."""
+    return [j for j in config.get("job_match", {}) if job_pay_schedule(config, j).get("type", "off") != "off"]
+
+
+def upcoming_paydays(config: dict, today: Optional[date] = None) -> list:
+    """[(job, payday, (period_start, period_end))] for each job with a pay schedule, soonest payday first."""
+    found = []
+    for job in scheduled_jobs(config):
+        nxt = next_payday(job_pay_schedule(config, job), today)
+        if nxt:
+            found.append((job, nxt[0], nxt[1]))
+    return sorted(found, key=lambda item: item[1])
+
+
 def next_payday(sched: dict, today: Optional[date] = None) -> Optional[tuple]:
     """(payday, (period_start, period_end)) for the next paycheck, or None."""
     today = today or date.today()
@@ -1140,10 +1162,14 @@ def next_payday(sched: dict, today: Optional[date] = None) -> Optional[tuple]:
     return min(upcoming, key=lambda c: c[0]) if upcoming else None
 
 
-def compute_pay_periods(calendar_service, config: dict, count: int = 6, today: Optional[date] = None) -> list:
-    """Paid hours/pay for the last `count` pay periods (including the current one), oldest first."""
+def compute_pay_periods(calendar_service, config: dict, count: int = 6, today: Optional[date] = None,
+                        job: Optional[str] = None) -> list:
+    """Paid hours/pay for the last `count` pay periods (including the current one), oldest first, for one job's schedule
+    (the first job that has one if none is named)."""
     today = today or date.today()
-    sched = config.get("pay_schedule") or {}
+    if job is None:  # with only the older single schedule, every job is paid together on it
+        job = next((j for j in scheduled_jobs(config) if j in (config.get("job_pay") or {})), None)
+    sched = job_pay_schedule(config, job) if job else (config.get("pay_schedule") or {})
     current = pay_period_bounds(today, sched)
     if current is None:
         raise ValueError("Set up your pay schedule in Settings first.")
@@ -1153,9 +1179,9 @@ def compute_pay_periods(calendar_service, config: dict, count: int = 6, today: O
     events, stale_at = fetch_events_or_cached(calendar_service, config, periods[0][0], current[1])
     rows = []
     for start, end in periods:
-        cat_hours = compute_category_hours([e for e in events if start <= e["day"] <= end])
+        cat_hours = compute_category_hours([e for e in events if start <= e["day"] <= end and (job is None or e["category"] == job)])
         hours, pay = paid_totals(cat_hours, config)
-        rows.append({"week_start": start, "week_end": end, "hours": hours, "pay": pay, "category_hours": cat_hours,
+        rows.append({"week_start": start, "week_end": end, "hours": hours, "pay": pay, "category_hours": cat_hours, "job": job,
                      "label": f"{start.month}/{start.day}-{end.month}/{end.day}", "current": (start, end) == current,
                      "payday": payday_for(end, sched), "stale_at": stale_at})
     return rows

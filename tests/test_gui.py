@@ -843,48 +843,57 @@ class GuiTests(unittest.TestCase):
         self.assertNotEqual(self._start_of(ev["id"]), before)       # confirmed: moved
         self.no_errors()
 
-    def test_26_pay_periods(self):
+    def test_26_pay_schedule_per_job(self):
         ep = self.app.pages["earnings"]
         self.app.show_page("earnings")
         self.pump(1.5)
-        ep._pick("Pay periods")                       # not configured yet: politely refuses
+        ep._pick("Pay periods")                       # nothing configured yet: politely refuses
         self.assertEqual(ep.mode[0], "weeks")
         sp = self.app.pages["settings"]
         self.app.show_page("settings")
         self.pump(1.0)
+        rows = {r["name"].get(): r for r in sp.job_rows}
         start = self.env.mon - timedelta(days=7)
-        sp.pay_type.set("biweekly")
-        sp.vars["pay_start"].delete(0, "end")
-        sp.vars["pay_start"].insert(0, core.fmt_date(start))
-        sp.vars["pay_delay"].delete(0, "end")
-        sp.vars["pay_delay"].insert(0, "5")
+        rows["Dominos"]["pay_type"].set("biweekly")
+        rows["Dominos"]["pay_start"].insert(0, core.fmt_date(start))
+        rows["Dominos"]["pay_delay"].delete(0, "end")
+        rows["Dominos"]["pay_delay"].insert(0, "5")
+        rows["Staples"]["pay_type"].set("weekly")
+        rows["Staples"]["pay_start"].insert(0, core.fmt_date(self.env.mon))
         sp.save()
         saved = json.loads(core.CONFIG_PATH.read_text(encoding="utf-8"))
-        self.assertEqual(saved["pay_schedule"], {"type": "biweekly", "start": start.isoformat(), "delay_days": 5})
+        self.assertEqual(saved["job_pay"]["Dominos"], {"type": "biweekly", "start": start.isoformat(), "delay_days": 5})
+        self.assertEqual(saved["job_pay"]["Staples"]["type"], "weekly")
+        self.assertEqual(saved["pay_schedule"]["type"], "off")
         self.app.show_page("earnings")
         ep.seg.set("Pay periods")
         ep._pick("Pay periods")
         self.pump(2.5)
-        self.assertEqual(len(ep.rows), 6)
-        self.assertTrue(ep.rows[-1]["current"])
-        self.assertIn("PAY PERIOD", ep.cards["avg"].title_lbl.cget("text"))
+        self.assertEqual((ep.period_job, len(ep.rows)), ("Dominos", 6))
+        self.assertEqual((ep.rows[-1]["week_end"] - ep.rows[-1]["week_start"]).days, 13)
+        ep._pick_job("Staples")
+        self.pump(2.5)
+        self.assertEqual((ep.rows[-1]["week_end"] - ep.rows[-1]["week_start"]).days, 6)
+        self.assertTrue(all(set(r["category_hours"]) <= {"Staples"} for r in ep.rows))
         d = self.app.pages["dashboard"]
         self.app.show_page("dashboard")
         d.refresh()
         self.pump(2.5)
-        self.assertIn("Payday", d.pay_break.cget("text"))
-        # a biweekly schedule without a start date is rejected and nothing is saved
+        text = d.pay_break.cget("text")
+        self.assertIn("Dominos payday", text)
+        self.assertIn("Staples payday", text)
+        # a job paid biweekly needs a date, and nothing is saved when it is missing
         self.app.show_page("settings")
         self.pump(0.8)
-        sp.pay_type.set("biweekly")
-        sp.vars["pay_start"].delete(0, "end")
+        rows = {r["name"].get(): r for r in sp.job_rows}
+        rows["Dominos"]["pay_start"].delete(0, "end")
+        before = core.CONFIG_PATH.read_text(encoding="utf-8")
         sp.save()
-        self.assertEqual(json.loads(core.CONFIG_PATH.read_text(encoding="utf-8"))["pay_schedule"]["type"], "biweekly")
-        self.assertNotEqual(json.loads(core.CONFIG_PATH.read_text(encoding="utf-8"))["pay_schedule"]["start"], "")
-        sp.pay_type.set("off")
-        sp.vars["pay_start"].insert(0, core.fmt_date(start))
+        self.assertEqual(core.CONFIG_PATH.read_text(encoding="utf-8"), before)
+        rows["Dominos"]["pay_type"].set("off")
         sp.save()
-        self.assertEqual(self.app.config_data["pay_schedule"]["type"], "off")
+        self.assertEqual(self.app.config_data["job_pay"]["Dominos"]["type"], "off")
+        self.assertEqual(core.scheduled_jobs(self.app.config_data), ["Staples"])
         self.app.show_page("earnings")
         ep.seg.set("8 weeks")
         ep._pick("8 weeks")
@@ -975,7 +984,7 @@ class GuiTests(unittest.TestCase):
 
     def test_29_new_layout_has_no_theme_picker_or_history(self):
         g = self.g
-        self.assertEqual([k for k, _t in g.App.NAV], ["dashboard", "week", "month", "plan", "earnings", "import",
+        self.assertEqual([k for k, _t in g.App.NAV], ["home", "dashboard", "week", "month", "plan", "earnings", "import",
                                                        "manage", "report", "settings", "help"])
         self.assertFalse(hasattr(g, "ACCENTS"))
         self.assertFalse(hasattr(self.app, "set_accent"))

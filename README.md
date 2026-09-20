@@ -10,11 +10,15 @@ It reads schedule emails from Gmail (written for Domino's "your schedule is..." 
 - Notices when a schedule is updated and can remove shifts that were dropped.
 - Week and month views. Drag events to move or resize them, or drag on empty space to add one.
 - Weekly report by email (styled HTML with a plain-text copy): hours and pay per job, conflicts, tight turnarounds, short rest between a late close and an early class.
-- Earnings by week, month or pay period, with an optional take-home estimate and next payday.
+- Earnings by week, month or pay period, with an optional take-home estimate and each job's next payday. Every job has its own pay schedule (for example weekly at one job and every two weeks at another), set under Settings > Jobs & pay.
 - A study planner that finds free time around your classes and shifts.
 - Search, a command palette (Ctrl+K), CSV and .ics export, undo for deletes and moves, offline mode, daily backups.
 
 Jobs are matched by words in the event title (for example `staples, work`), and classes are recognised by course code (`CIS 111`). Both are configurable in Settings.
+
+## More than a schedule
+
+The app opens on a Home page, and each tool is a module with its own pages in the sidebar. The schedule is the first one; receipts and TrueNAS storage are planned. `docs/ADDING_A_MODULE.md` explains how to add one (a module lists its pages, may add Settings tabs, and gets its own data folder).
 
 ## Setup
 

@@ -30,6 +30,7 @@ import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageFont
 
 import dominos_schedule as core
+import hub
 import sync
 import tablet_server
 import updater
@@ -51,8 +52,8 @@ C = {
 }
 cat_color = core.category_color
 
-NAV_ICONS = {"dashboard": "\ue80f", "week": "\ue8c0", "month": "\ue787", "plan": "\ue7be", "earnings": "\ue8c7",
-             "import": "\ue896", "manage": "\ue71d", "report": "\ue8a5", "settings": "\ue713", "help": "\ue897"}
+NAV_ICONS: dict = {}  # filled from the registered modules at the bottom of this file
+APP_TITLE = "Schedule Manager"
 ICON_FONT_FILES = (r"C:\Windows\Fonts\SegoeIcons.ttf", r"C:\Windows\Fonts\segmdl2.ttf")
 WHEEL = {"px": 96}
 
@@ -192,6 +193,10 @@ def friendly_error(e: BaseException) -> str:
     if "getaddrinfo" in low or "connection aborted" in low or "timed out" in low:
         return "Can't reach Google. Check your internet connection."
     return text if len(text) < 300 else text[:297] + "..."
+
+
+def window_title() -> str:
+    return f"{APP_TITLE} v{core.APP_VERSION}"
 
 
 def hidden_mode() -> bool:
@@ -466,16 +471,16 @@ class LazyPages(dict):
     def __missing__(self, key):
         if key not in self.app.PAGES:
             raise KeyError(key)
-        page = globals()[self.app.PAGES[key]](self.app.content, self.app)
+        spec = self.app.PAGES[key]
+        page = (globals()[spec] if isinstance(spec, str) else spec)(self.app.content, self.app)
         self[key] = page
         return page
 
 
 class App(ctk.CTk):
-    NAV = [("dashboard", "Dashboard"), ("week", "Week"), ("month", "Month"), ("plan", "Study planner"), ("earnings", "Earnings"),
-           ("import", "Import"), ("manage", "Manage weeks"), ("report", "Report"), ("settings", "Settings"),
-           ("help", "About & help")]
-    NAV_SECTIONS = {"dashboard": "", "import": "SCHEDULE", "settings": "APP"}  # a small heading above these items
+    NAV: list = []           # (key, title) for every page, in sidebar order; set from the modules below
+    NAV_SECTIONS: dict = {}  # a small heading above the first page of a module
+    PAGES: dict = {}         # key -> page class name
 
     def __init__(self):
         try:
@@ -488,7 +493,7 @@ class App(ctk.CTk):
         icon_image.cache_clear()  # images belong to one Tk root; a fresh window needs fresh ones
         if hidden_mode():
             self.attributes("-alpha", 0.0)
-        self.title(f"Schedule Manager v{core.APP_VERSION}")
+        self.title(window_title())
         self.prefs = load_prefs()
         self.configure(fg_color=C["bg"])
         self.minsize(980, 620)
@@ -533,7 +538,7 @@ class App(ctk.CTk):
         self.config_stamp = 0
         self._load_config()
         self._build_ui()
-        self.show_page("dashboard")
+        self.show_page("home")
         self.after(1500, self._prebuild_pages)
         self.bind("<F5>", lambda _e: self.pages[self.current].refresh())
         self.bind("<F11>", lambda _e: self.attributes("-fullscreen", not self.attributes("-fullscreen")))
@@ -543,7 +548,7 @@ class App(ctk.CTk):
             self.bind(combo, lambda _e: self.search())
         for combo in ("<Control-k>", "<Control-K>"):
             self.bind(combo, lambda _e: self.palette())
-        for i, (key, _t) in enumerate(self.NAV, start=1):
+        for i, (key, _t) in enumerate(self.NAV[:10], start=1):
             self.bind(f"<Control-Key-{i % 10}>", lambda _e, k=key: self.show_page(k))
 
         # Trackpads (Windows precision touchpads) send <TouchpadScroll>; Tk 9 handles it for tables and text
@@ -561,17 +566,14 @@ class App(ctk.CTk):
         """The window opens filling the screen (F11 goes fully fullscreen)."""
         self.wm_state("zoomed")
 
-    PAGES = {"dashboard": "DashboardPage", "week": "WeekPage", "month": "MonthPage", "plan": "PlanPage",
-             "earnings": "EarningsPage", "import": "ImportPage", "manage": "ManagePage", "report": "ReportPage",
-             "settings": "SettingsPage", "help": "HelpPage"}
-
     def _build_ui(self):
         self._style_ttk()
         self.pages, self.nav_buttons, self.current = LazyPages(self), {}, None
         self._build_sidebar()
         self.content = ctk.CTkFrame(self, fg_color="transparent")
         self.content.pack(side="left", fill="both", expand=True, padx=(4, 30), pady=(26, 20))
-        self.pages["dashboard"]
+        self.pages["home"]
+        self.pages["dashboard"]  # the schedule overview loads its data at start-up, and Home reads it
 
     def _prebuild_pages(self):
         """Build the pages that haven't been opened yet, one at a time while the app is idle, so the first visit is instant."""
@@ -605,8 +607,9 @@ class App(ctk.CTk):
             ctk.CTkLabel(brand, image=img, text="").pack(side="left")
         names = ctk.CTkFrame(brand, fg_color="transparent")
         names.pack(side="left", padx=12)
-        label(names, "Schedule", 17, "bold").pack(anchor="w")
-        label(names, "Manager", 12, color=C["muted"]).pack(anchor="w")
+        title, _, rest = APP_TITLE.partition(" ")
+        label(names, title, 17, "bold").pack(anchor="w")
+        label(names, rest or " ", 12, color=C["muted"]).pack(anchor="w")
 
         for key, text in self.NAV:
             heading = self.NAV_SECTIONS.get(key)
@@ -769,6 +772,12 @@ class App(ctk.CTk):
         page = self.pages.get("settings")
         if page is not None:
             page.show_sync_status()
+        self._touch_home()
+
+    def _touch_home(self):
+        home = self.pages.get("home")
+        if home is not None:
+            home.refresh_cards()
 
     def _periodic_sync(self):
         self.sync_now()
@@ -889,6 +898,7 @@ class App(ctk.CTk):
         page = self.pages.get("help")
         if page is not None:
             page.show_update_status()
+        self._touch_home()
 
     def _after_update_notice(self):
         failed = core.BASE_DIR / "update_failed.txt"
@@ -1529,6 +1539,123 @@ def stat_card(parent, title):
     return c, value
 
 
+class HomePage(Page):
+    """The landing page: one card per tool, plus this computer's sync, update and tablet status."""
+
+    def __init__(self, master, app):
+        super().__init__(master, app)
+        self.build_header("Home", "")
+        self.scroll = scroll_frame(self)
+        self.scroll.pack(fill="both", expand=True)
+        body = ctk.CTkFrame(self.scroll, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=(0, 6))
+        body.grid_columnconfigure(0, weight=3, uniform="h")
+        body.grid_columnconfigure(1, weight=2, uniform="h")
+
+        self.sched = card(body)
+        self.sched.grid(row=0, column=0, sticky="nsew", padx=(0, 10), pady=(0, 10))
+        label(self.sched, "SCHEDULE", 10, "bold", C["dim"]).pack(anchor="w", padx=24, pady=(20, 0))
+        self.next_title = label(self.sched, "Loading...", 30, "bold")
+        self.next_title.pack(anchor="w", padx=24, pady=(6, 0))
+        self.next_time = label(self.sched, "", 14, color=C["muted"])
+        self.next_time.pack(anchor="w", padx=24)
+        self.next_count = label(self.sched, "", 15, "bold", C["accent"])
+        self.next_count.pack(anchor="w", padx=24, pady=(10, 0))
+        row = ctk.CTkFrame(self.sched, fg_color="transparent")
+        row.pack(fill="x", padx=24, pady=(16, 6))
+        self.mini = {}
+        for i, name in enumerate(["Hours this week", "Est. pay", "Conflicts"]):
+            box = ctk.CTkFrame(row, fg_color=C["card2"], corner_radius=12)
+            box.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 8, 0))
+            row.grid_columnconfigure(i, weight=1, uniform="m")
+            label(box, name.upper(), 10, "bold", C["dim"]).pack(anchor="w", padx=14, pady=(12, 0))
+            self.mini[name] = label(box, "-", 20, "bold")
+            self.mini[name].pack(anchor="w", padx=14, pady=(0, 12))
+        button(self.sched, "Open schedule", lambda: app.show_page("dashboard"), "primary", width=150).pack(
+            anchor="w", padx=24, pady=(10, 22))
+
+        self.here = card(body)
+        self.here.grid(row=0, column=1, sticky="nsew", pady=(0, 10))
+        label(self.here, "THIS COMPUTER", 10, "bold", C["dim"]).pack(anchor="w", padx=22, pady=(20, 6))
+        self.status_lines = {}
+        for name in ("Sync", "Updates", "Tablet display"):
+            block = ctk.CTkFrame(self.here, fg_color="transparent")
+            block.pack(fill="x", padx=22, pady=(4, 8))
+            label(block, name, 13, "bold").pack(anchor="w")
+            self.status_lines[name] = label(block, "-", 12, color=C["muted"], wraplength=300, justify="left", anchor="w")
+            self.status_lines[name].pack(anchor="w")
+        row = ctk.CTkFrame(self.here, fg_color="transparent")
+        row.pack(fill="x", padx=22, pady=(4, 20))
+        button(row, "Settings", lambda: app.show_page("settings"), "normal", width=100).pack(side="left", padx=(0, 8))
+        button(row, "Updates", lambda: app.show_page("help"), "normal", width=100).pack(side="left")
+
+        self.planned = card(body)
+        self.planned.grid(row=1, column=0, columnspan=2, sticky="nsew")
+        label(self.planned, "COMING NEXT", 10, "bold", C["dim"]).pack(anchor="w", padx=24, pady=(20, 6))
+        for name, blurb in hub.PLANNED:
+            line = ctk.CTkFrame(self.planned, fg_color="transparent")
+            line.pack(fill="x", padx=24, pady=3)
+            label(line, name, 13, "bold").pack(side="left")
+            label(line, "   " + blurb, 13, color=C["muted"]).pack(side="left")
+        label(self.planned, "New tools appear here and in the sidebar as soon as they are added.", 12,
+              color=C["muted"]).pack(anchor="w", padx=24, pady=(8, 20))
+        self._tablet_text = "Checking..."
+
+    def on_show(self):
+        now = datetime.now()
+        greet = "Good morning" if now.hour < 12 else "Good afternoon" if now.hour < 18 else "Good evening"
+        name = (self.app.config_data or {}).get("display_name", "")
+        self.title_lbl.configure(text=f"{greet}{', ' + name if name else ''}")
+        self.sub_lbl.configure(text=f"{now:%A, %B} {now.day}")
+        self.refresh_cards()
+        port = tablet_server.configured_port(self.app.config_data)
+        self.app.run_async(lambda: tablet_server.tablet_status(port), self._tablet_done, lambda _e: None)
+
+    def refresh(self):
+        self.on_show()
+
+    def _tablet_done(self, status):
+        self._tablet_text = ("Running at " + status["url"]) if status["running"] else "Stopped"
+        self.refresh_cards()
+
+    def refresh_cards(self):
+        dash = self.app.pages.get("dashboard")
+        try:
+            self._show_schedule(dash)
+            app = self.app
+            self.status_lines["Sync"].configure(text=app.sync_text or ("Off on this computer" if not sync.enabled(app.config_data) else "Not synced yet"))
+            self.status_lines["Updates"].configure(text=app.update_text or ("Runs from the source folder" if not updater.is_installed() else "Not checked yet"))
+            self.status_lines["Tablet display"].configure(text=self._tablet_text)
+        except tk.TclError:
+            pass
+
+    def _show_schedule(self, dash):
+        data = getattr(dash, "data", None)
+        if not data:
+            return
+        now = datetime.now()
+        upcoming = [e for e in (dash.future or []) if e["end"] >= now]
+        if upcoming:
+            ev = upcoming[0]
+            self.next_title.configure(text=ev["summary"])
+            self.next_time.configure(text=f"{core.DAY_ABBR[ev['day'].weekday()]} {core.fmt_date_short(ev['day'])}  \u00b7  "
+                                          f"{core.fmt_time(ev['start'])} - {core.fmt_time(ev['end'])}")
+            if ev["start"] <= now <= ev["end"]:
+                self.next_count.configure(text="Happening now", text_color=C["success"])
+            else:
+                self.next_count.configure(text=humanize_delta(ev["start"] - now).replace("in ", "Starts in "), text_color=C["accent"])
+        else:
+            self.next_title.configure(text="Nothing coming up")
+            self.next_time.configure(text="")
+            self.next_count.configure(text="")
+        rep = data["this"]
+        hours, pay = core.paid_totals(rep["category_hours"], self.app.config_data)
+        conflicts = sum(len(v) for v in rep["conflicts"].values())
+        self.mini["Hours this week"].configure(text=f"{hours:.1f}h")
+        self.mini["Est. pay"].configure(text=f"${pay:,.0f}")
+        self.mini["Conflicts"].configure(text=str(conflicts), text_color=C["warning"] if conflicts else C["success"])
+
+
 class DashboardPage(Page):
     def __init__(self, master, app):
         super().__init__(master, app)
@@ -1727,6 +1854,7 @@ class DashboardPage(Page):
             label(self.upcoming_box, "Nothing coming up.", 13, color=C["muted"]).pack(anchor="w", padx=8, pady=8)
 
         self._banner(data.get("emails"))
+        self.app._touch_home()
 
     def _set_range(self, value):
         self.range = value
@@ -1752,9 +1880,8 @@ class DashboardPage(Page):
                  for j in jobs if rep["category_hours"].get(j)]
         if pay > 0 and float(cfg.get("tax_rate_percent") or 0) > 0:
             lines.append(f"Take-home ~ ${core.take_home(pay, cfg):,.2f}")
-        upcoming = core.next_payday(cfg.get("pay_schedule") or {})
-        if upcoming:
-            lines.append(f"Payday {core.DAY_ABBR[upcoming[0].weekday()]} {core.fmt_date_short(upcoming[0])}")
+        for job, payday, _bounds in core.upcoming_paydays(cfg):
+            lines.append(f"{job} payday {core.DAY_ABBR[payday.weekday()]} {core.fmt_date_short(payday)}")
         self.pay_break.configure(text="\n".join(lines) if lines else "No paid shifts")
 
         # long events that matched no job (e.g. a shift titled "Work") are probably missing from pay
@@ -2308,6 +2435,7 @@ class EarningsPage(Page):
         super().__init__(master, app)
         self.rows = []
         self.mode = ("weeks", 8)
+        self.period_job = None  # which job's pay periods the Pay periods view shows
         actions = self.build_header("Earnings", "Estimated pay from your calendar, by week")
         self.seg = segmented(actions, values=["4 weeks", "8 weeks", "12 weeks", "6 months", "Pay periods"],
                                           command=self._pick,
@@ -2315,6 +2443,7 @@ class EarningsPage(Page):
                                           unselected_color=C["card2"], fg_color=C["card2"], font=font(13, "bold"))
         self.seg.set("8 weeks")
         self.seg.pack(side="left", padx=4)
+        self.job_menu = option_menu(actions, ["-"], self._pick_job, width=130)
         button(actions, "Jobs & pay", app.edit_jobs, "normal", width=110).pack(side="left", padx=4)
         button(actions, "Refresh", self.refresh, "normal", width=90).pack(side="left", padx=4)
 
@@ -2337,14 +2466,26 @@ class EarningsPage(Page):
 
     def _pick(self, value):
         if value == "Pay periods":
-            if core.pay_period_bounds(date.today(), self.app.config_data.get("pay_schedule")) is None:
-                self.app.toast("Set up your pay schedule under Settings first.", "warn")
+            jobs = core.scheduled_jobs(self.app.config_data)
+            if not jobs:
+                self.app.toast("Set up a pay schedule for a job under Settings > Jobs & pay first.", "warn")
                 self.seg.set(self._seg_label())
                 return
+            if self.period_job not in jobs:
+                self.period_job = jobs[0]
+            self.job_menu.configure(values=jobs)
+            self.job_menu.set(self.period_job)
+            if len(jobs) > 1:
+                self.job_menu.pack(side="left", padx=4, after=self.seg)
             self.mode = ("periods", 6)
         else:
             n, unit = value.split()
             self.mode = (unit, int(n))
+            self.job_menu.pack_forget()
+        self.refresh()
+
+    def _pick_job(self, job):
+        self.period_job = job
         self.refresh()
 
     def _seg_label(self):
@@ -2363,7 +2504,7 @@ class EarningsPage(Page):
         def work():
             _, cal = core.build_services()
             fn = {"months": core.compute_monthly_earnings, "periods": core.compute_pay_periods}.get(unit, core.compute_weekly_earnings)
-            return fn(cal, cfg, n)
+            return fn(cal, cfg, n, job=self.period_job) if unit == "periods" else fn(cal, cfg, n)
 
         def done(rows):
             self.loaded = True
@@ -2377,7 +2518,8 @@ class EarningsPage(Page):
     def _summary(self):
         rows, cfg = self.rows, self.app.config_data
         per = {"months": "month", "periods": "pay period"}.get(self.mode[0], "week")
-        self.sub_lbl.configure(text=f"Estimated pay from your calendar, by {per}")
+        of = f" ({self.period_job})" if self.mode[0] == "periods" and self.period_job else ""
+        self.sub_lbl.configure(text=f"Estimated pay from your calendar, by {per}{of}")
         self.cards["avg"].title_lbl.configure(text=f"AVERAGE / {per.upper()}")
         self.cards["best"].title_lbl.configure(text=f"BEST {per.upper()}")
         self.cards["hrs"].title_lbl.configure(text=f"AVG HOURS / {per.upper()}")
@@ -3008,28 +3150,21 @@ class SettingsPage(Page):
 
         self._tab = self.tab_frames["Jobs & pay"]
         b = self._section("Jobs & pay", "Any calendar event whose title contains the match text counts as that job. "
-                          "Turn on back-to-back OK when a job splits shifts for a break.")
+                          "Turn on back-to-back OK when a job splits shifts for a break. Under each job, say how often it pays: that adds "
+                          "a Pay periods view to Earnings and shows each job's next payday.")
         self.jobs_box = b
         for col, t in enumerate(["Job", "Title contains (comma separated)", "$ / hour", ""]):
             label(b, t, 12, "bold", C["muted"]).grid(row=0, column=col, sticky="w", padx=(0, 10))
         wages, brk = cfg.get("job_wages", {}), set(cfg.get("break_ok_categories", []))
+        self._job_slot = 0
         for name, match in cfg.get("job_match", {}).items():
-            self._add_job(name, match, wages.get(name, 0), name in brk)
-        button(b, "+ Add job", lambda: self._add_job("", "", 0, False), "normal", width=110).grid(
-            row=99, column=0, sticky="w", pady=(10, 0))
+            self._add_job(name, match, wages.get(name, 0), name in brk, core.job_pay_schedule(cfg, name))
+        button(b, "+ Add job", lambda: self._add_job("", "", 0, False, {}), "normal", width=110).grid(
+            row=999, column=0, sticky="w", pady=(12, 0))
 
         b = self._section("Taxes", "Optional. Adds a take-home estimate next to your pay. Set 0 to hide it.")
         self._field(b, 0, "tax_rate_percent", "Estimated tax withheld (%)", f"{float(cfg.get('tax_rate_percent') or 0):g}", width=100)
 
-        b = self._section("Pay schedule", "Optional. Adds a Pay periods view to Earnings and shows your next payday.")
-        sched = cfg.get("pay_schedule") or {}
-        label(b, "How often you're paid", 13, color=C["muted"]).grid(row=0, column=0, sticky="w", pady=6, padx=(0, 16))
-        self.pay_type = option_menu(b, list(core.PAY_TYPES), width=170)
-        self.pay_type.set(sched.get("type", "off") if sched.get("type") in core.PAY_TYPES else "off")
-        self.pay_type.grid(row=0, column=1, sticky="w", pady=6)
-        self._field(b, 1, "pay_start", "A pay period start date", core.fmt_date(date.fromisoformat(sched["start"]))
-                    if sched.get("start") else "", width=140, hint="Any first day of a pay period (weekly / every two weeks).")
-        self._field(b, 2, "pay_delay", "Days from period end to payday", int(sched.get("delay_days") or 0), width=100)
 
         self._tab = self.tab_frames["Alerts"]
         b = self._section("Conflict alerts", "Overlaps are always flagged. Gaps shorter than these are called out.")
@@ -3106,29 +3241,68 @@ class SettingsPage(Page):
                                 ("Open app folder", lambda: os.startfile(BASE), "normal")]:
             button(row, text, cmd, kind).pack(side="left", padx=(0, 8), pady=2)
 
-    def _add_job(self, name, match, wage, brk):
-        r = len(self.job_rows) + 1
+    def _add_job(self, name, match, wage, brk, pay=None):
+        pay = pay or {}
+        self._job_slot += 2
+        r = self._job_slot
         n = entry(self.jobs_box, width=140, placeholder="Job name")
         n.insert(0, name)
         m = entry(self.jobs_box, width=170, placeholder="text in title")
         m.insert(0, match)
         w = entry(self.jobs_box, width=90, placeholder="0.00")
         w.insert(0, f"{wage:g}" if wage else "")
-        sw = switch(self.jobs_box, text="Back-to-back OK", progress_color=C["accent"], font=font(12))
+        sw = switch(self.jobs_box, text="Back-to-back OK")
         if brk:
             sw.select()
         for col, wdg in enumerate([n, m, w, sw]):
-            wdg.grid(row=r, column=col, sticky="w", padx=(0, 10), pady=4)
+            wdg.grid(row=r, column=col, sticky="w", padx=(0, 10), pady=(10, 2))
         rec = {"name": n, "match": m, "wage": w, "brk": sw}
         x = button(self.jobs_box, "Remove", lambda: self._remove_job(rec), "ghost", width=80)
-        x.grid(row=r, column=4, sticky="w")
+        x.grid(row=r, column=4, sticky="w", pady=(10, 2))
         rec["remove"] = x
+
+        line = ctk.CTkFrame(self.jobs_box, fg_color="transparent")
+        line.grid(row=r + 1, column=0, columnspan=5, sticky="w", pady=(0, 4))
+        label(line, "Paid", 12, color=C["muted"]).pack(side="left", padx=(0, 8))
+        kind = option_menu(line, list(core.PAY_TYPES), width=150)
+        kind.set(pay.get("type") if pay.get("type") in core.PAY_TYPES else "off")
+        kind.pack(side="left")
+        label(line, "a pay period starts", 12, color=C["muted"]).pack(side="left", padx=(16, 8))
+        start = entry(line, width=120, placeholder="e.g. 9/7/2026")
+        if pay.get("start"):
+            start.insert(0, core.fmt_date(date.fromisoformat(pay["start"])))
+        start.pack(side="left")
+        label(line, "payday is", 12, color=C["muted"]).pack(side="left", padx=(16, 8))
+        delay = entry(line, width=60)
+        delay.insert(0, str(int(pay.get("delay_days") or 0)))
+        delay.pack(side="left")
+        label(line, "days after it ends", 12, color=C["muted"]).pack(side="left", padx=(8, 0))
+        rec.update({"pay_line": line, "pay_type": kind, "pay_start": start, "pay_delay": delay})
         self.job_rows.append(rec)
 
     def _remove_job(self, rec):
-        for k in ("name", "match", "wage", "brk", "remove"):
+        for k in ("name", "match", "wage", "brk", "remove", "pay_line"):
             rec[k].destroy()
         self.job_rows.remove(rec)
+
+    @staticmethod
+    def _pay_for(rec) -> dict:
+        """One job's pay schedule from its row, or a ValueError that names the problem."""
+        kind, start_text = rec["pay_type"].get(), rec["pay_start"].get()
+        job = rec["name"].get().strip() or "a job"
+        try:
+            start = core.parse_date_flexible(start_text).isoformat() if start_text.strip() else ""
+        except ValueError:
+            raise ValueError(f"{job}: the pay period start date isn't a date") from None
+        if kind in ("weekly", "biweekly") and not start:
+            raise ValueError(f"{job}: enter a date that a pay period starts on")
+        try:
+            delay = int(rec["pay_delay"].get() or 0)
+        except ValueError:
+            raise ValueError(f"{job}: days to payday must be a number") from None
+        if not 0 <= delay <= 60:
+            raise ValueError(f"{job}: days to payday must be between 0 and 60")
+        return {"type": kind, "start": start, "delay_days": delay}
 
     def _tablet_port(self) -> int:
         try:
@@ -3235,14 +3409,13 @@ class SettingsPage(Page):
                 "reminder_minutes_before": core.reminder_list({"reminder_minutes_before": g("reminder_minutes_before")}),
                 "tax_rate_percent": self._tax(g("tax_rate_percent")),
                 "email_html": bool(self.email_html.get()),
-                "pay_schedule": self._pay_schedule(g("pay_start"), g("pay_delay")),
                 "min_rest_hours": self._nonneg(g("min_rest_hours"), 24), "weekly_hours_goal": self._nonneg(g("weekly_hours_goal"), 168),
                 "conflict_thresholds_minutes": {"very_close": int(g("very_close")), "close": int(g("close"))},
                 "school_course_code_regex": g("school_course_code_regex"),
                 "school_extra_titles": split(g("school_extra_titles")),
                 "school_exceptions": split(g("school_exceptions")),
             })
-            job_match, job_wages, brk = {}, {}, []
+            job_match, job_wages, brk, job_pay = {}, {}, [], {}
             for r in self.job_rows:
                 name = r["name"].get().strip()
                 if not name:
@@ -3251,7 +3424,15 @@ class SettingsPage(Page):
                 job_wages[name] = float(r["wage"].get().strip() or 0)
                 if r["brk"].get():
                     brk.append(name)
+                pay = self._pay_for(r)
+                # a job that isn't paid on a schedule gets no entry (unless it had one, or the older single schedule is being moved onto the jobs)
+                if pay["type"] != "off" or name in (raw.get("job_pay") or {}) or (raw.get("pay_schedule") or {}).get("type", "off") != "off":
+                    job_pay[name] = pay
             raw.update({"job_match": job_match, "job_wages": job_wages, "break_ok_categories": brk})
+            if job_pay or "job_pay" in raw:
+                raw["job_pay"] = job_pay
+                if (raw.get("pay_schedule") or {}).get("type", "off") != "off":
+                    raw["pay_schedule"] = {"type": "off", "start": "", "delay_days": 0}  # the older single schedule now lives on each job
             port = self._port(g("tablet_port"))
             if port != tablet_server.DEFAULT_PORT or "tablet_port" in raw:  # don't add a setting nobody changed
                 raw["tablet_port"] = port
@@ -3281,18 +3462,6 @@ class SettingsPage(Page):
         if not 0 <= value <= maximum:
             raise ValueError(f"must be between 0 and {maximum:g}")
         return value
-
-    def _pay_schedule(self, start_text: str, delay_text: str) -> dict:
-        kind = self.pay_type.get()
-        start = ""
-        if kind in ("weekly", "biweekly"):
-            start = core.parse_date_flexible(start_text).isoformat()
-        elif start_text.strip():
-            start = core.parse_date_flexible(start_text).isoformat()
-        delay = int(delay_text or 0)
-        if not 0 <= delay <= 60:
-            raise ValueError("days to payday must be between 0 and 60")
-        return {"type": kind, "start": start, "delay_days": delay}
 
     @staticmethod
     def _tax(text: str) -> float:
@@ -3435,6 +3604,8 @@ class HelpPage(Page):
         return body
 
     WHATS_NEW = [
+        "The app opens on Home, and the schedule is now one tool among others. More tools (receipts, storage) can be added later.",
+        "Each job has its own pay schedule (Settings > Jobs & pay), so weekly and every-two-weeks jobs can sit side by side.",
         "A new look, and the app opens filling the screen (F11 for true fullscreen). Scrolling is smoother.",
         "Import shows what will change before you confirm: new shifts, ones already on your calendar, and any conflicts.",
         "Drag events in the Week view to move or resize them, or drag on empty space to add one. Undo is always there.",
@@ -3558,6 +3729,19 @@ class HelpPage(Page):
             self.app.toast("No errors have been logged. That's good news.", "success")
 
 
+hub.register(hub.Module("home", "Home", "Everything at a glance", pages=[hub.PageSpec("home", "Home", "", "HomePage")]))
+hub.register(hub.Module("schedule", "Schedule", "Work and school schedule, pay, and the tablet display", section="SCHEDULE", pages=[
+    hub.PageSpec("dashboard", "Overview", "", "DashboardPage"), hub.PageSpec("week", "Week", "", "WeekPage"),
+    hub.PageSpec("month", "Month", "", "MonthPage"), hub.PageSpec("plan", "Study planner", "", "PlanPage"),
+    hub.PageSpec("earnings", "Earnings", "", "EarningsPage"), hub.PageSpec("import", "Import", "", "ImportPage"),
+    hub.PageSpec("manage", "Manage weeks", "", "ManagePage"), hub.PageSpec("report", "Report", "", "ReportPage")]))
+hub.register(hub.Module("app", "App", "Settings and help", section="APP", pages=[
+    hub.PageSpec("settings", "Settings", "", "SettingsPage"), hub.PageSpec("help", "About & help", "", "HelpPage")]))
+App.NAV = hub.nav()
+App.NAV_SECTIONS = hub.sections()
+App.PAGES = {page.key: page.cls for page in hub.all_pages()}
+NAV_ICONS.update({page.key: page.icon for page in hub.all_pages()})
+
 HELPER_FLAGS = ("--uninstall", "--tablet", "--tablet-launch", "--tablet-stop")
 
 
@@ -3588,7 +3772,7 @@ def main():
     global _mutex_handle
     first, _mutex_handle = acquire_single_instance()
     if not first:
-        focus_existing_window(f"Schedule Manager v{core.APP_VERSION}")
+        focus_existing_window(window_title())
         return
     try:
         App().mainloop()
