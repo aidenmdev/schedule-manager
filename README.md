@@ -29,7 +29,7 @@ Jobs are matched by words in the event title (for example `staples, work`), and 
 
 ## Updating your other computers
 
-Change the code on your main computer, then run `publish_update.bat "what changed"`. It rebuilds the program, works out which files changed since the installer (usually 3 or 4 files, about 9 MB), signs the update and publishes it to the `updates` branch of your GitHub project (`aidenmdev/schedule-manager`, set in `release\repo.txt` if you use another). It pushes with the git that is already signed in on this computer, and each publish replaces the previous one, so the branch stays one commit.
+Change the code on your main computer, then run `publish_update.bat "what changed"`. It rebuilds the program, works out which files changed since the installer (usually 3 or 4 files, about 9 MB), signs the update and publishes it to the `updates` branch of your GitHub project (`aidenmdev/schedule-manager`, set in `release\repo.txt` if you use another). It pushes with the git that is already signed in on this computer, and each publish replaces the previous one, so the branch stays one commit. GitHub's cache can take up to five minutes to show a new update to the other computers.
 
 Each installed copy checks for an update when it opens (at most twice a day) and under About & help > Updates, where "Check for updates" and "Update now" do it on demand. Nothing installs without you choosing Update now. The app closes, a small helper swaps the files in, and it reopens by itself. If anything goes wrong, the previous version is put back and the app tells you.
 
