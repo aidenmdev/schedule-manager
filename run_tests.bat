@@ -25,5 +25,6 @@ echo === The real app against fake Google (windows will flash open and closed) =
 ".venv\Scripts\python.exe" -m unittest tests.test_gui
 ".venv\Scripts\python.exe" -m unittest tests.test_gui_sync
 ".venv\Scripts\python.exe" -m unittest tests.test_gui_updates
+".venv\Scripts\python.exe" -m unittest tests.test_gui_tablet
 echo.
 pause

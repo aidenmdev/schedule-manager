@@ -53,9 +53,9 @@ Two computers can change different settings at the same time and both changes ar
 
 Shows your week (read-only, no pay) on any device on your home Wi-Fi, such as an old tablet used as a wall calendar. The page is plain HTML and CSS so it works in old Android browsers, and it refreshes itself every few minutes.
 
-Double-click `Tablet Display.vbs`. It starts in the background with no window and pops up the address to open on the tablet, something like `http://192.168.1.20:8765`. Windows asks the first time whether Python may use your network; allow it on private networks. `Stop Tablet Display.bat` turns it off. `Tablet Auto-Start ON.bat` starts it quietly each time you sign in to Windows (`OFF` undoes that).
+Open Settings > Tablet. It shows whether the display is running and the address to type on the tablet, something like `http://192.168.1.20:8765`, with Start, Stop and Copy address buttons. It runs in the background with no window and keeps going after you close the app until you press Stop. The same controls exist as Start menu shortcuts in the installed app, and as `Tablet Display.vbs` and `Stop Tablet Display.bat` when running from the folder. `Tablet Auto-Start ON.bat` starts it quietly each time you sign in to Windows (`OFF` undoes that).
 
-The PC has to be on and awake for the tablet to show anything. Nothing is exposed to the internet, but anyone on your Wi-Fi can open the page. `tablet_port` in `config.json` changes the port (default 8765). If it doesn't start, look in `tablet.log`.
+Windows asks the first time whether Python may use your network; allow it on private networks. The PC has to be on and awake for the tablet to show anything, and the tablet has to be on the same Wi-Fi. Nothing is exposed to the internet, but anyone on your Wi-Fi can open the page. The port (default 8765) is set on the same tab. If it doesn't start, look in `tablet.log`.
 
 ## Command line
 
@@ -74,6 +74,7 @@ python dominos_schedule.py -h
 .venv\Scripts\python.exe -m unittest tests.test_gui
 .venv\Scripts\python.exe -m unittest tests.test_scroll
 .venv\Scripts\python.exe -m unittest tests.test_tablet
+.venv\Scripts\python.exe -m unittest tests.test_gui_tablet
 .venv\Scripts\python.exe -m unittest tests.test_sync
 .venv\Scripts\python.exe -m unittest tests.test_installer
 .venv\Scripts\python.exe -m unittest tests.test_updater

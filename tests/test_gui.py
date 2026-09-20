@@ -988,7 +988,7 @@ class GuiTests(unittest.TestCase):
         texts = " ".join(str(getattr(w, "_text", "")) for w in find_widgets(sp, ctk.CTkLabel))
         self.assertNotIn("Appearance", texts)
         self.assertNotIn("accent", texts.lower())
-        self.assertEqual(list(sp.tab_frames), ["General", "Jobs & pay", "Alerts", "Data"])
+        self.assertEqual(list(sp.tab_frames), ["General", "Jobs & pay", "Alerts", "Tablet", "Data"])
         self.no_errors()
 
     def test_30_pages_build_once_and_settings_only_rebuild_when_config_changes(self):

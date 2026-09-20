@@ -16,6 +16,7 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
+from typing import Optional
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -453,11 +454,55 @@ def main(argv=None) -> None:
         server.server_close()
 
 
-def background_command() -> list:
+def configured_port(config: Optional[dict] = None) -> int:
+    try:
+        return int((config or {}).get("tablet_port") or DEFAULT_PORT)
+    except (TypeError, ValueError):
+        return DEFAULT_PORT
+
+
+def tablet_status(port: int) -> dict:
+    """{'running': bool, 'ip': this computer's address on the network, 'url': what to type on the tablet}."""
+    ip = lan_address()
+    return {"running": already_running(port), "ip": ip, "url": f"http://{ip}:{port}", "port": port}
+
+
+def background_command(port: int) -> list:
     if getattr(sys, "frozen", False):
-        return [sys.executable, "--tablet"]
+        return [sys.executable, "--tablet", "--port", str(port)]
     pyw = Path(sys.executable).with_name("pythonw.exe")
-    return [str(pyw if pyw.exists() else sys.executable), str(Path(__file__).resolve())]
+    return [str(pyw if pyw.exists() else sys.executable), str(Path(__file__).resolve()), "--port", str(port)]
+
+
+def start_background(port: int) -> bool:
+    """Start the server with no window and wait for it to answer. True if it is running afterwards."""
+    if already_running(port):
+        return True
+    try:
+        STATUS_PATH.unlink()
+    except OSError:
+        pass
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+    subprocess.Popen(background_command(port), creationflags=flags, close_fds=True, cwd=str(core.BASE_DIR))
+    for _ in range(40):
+        if already_running(port):
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def stop_processes(port: Optional[int] = None) -> bool:
+    """Stop the tablet server (only the one on `port`, if given). True if something was stopped."""
+    only = ""
+    if port:
+        only = (r" -and ($_.CommandLine -match '--port\s+" + str(int(port)) + r"(\s|$)' -or $_.CommandLine -notmatch '--port')")
+    script = ("$p = Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne " + str(os.getpid()) +
+              r" -and $_.Name -match '^(ScheduleManager|pythonw?)\.exe$' "
+              r"-and $_.CommandLine -match '(--tablet(\s|$)|tablet_server\.py)'" + only + " }; "
+              "if ($p) { $p | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; 'stopped' } else { 'none' }")
+    result = subprocess.run(["powershell", "-NoProfile", "-Command", script], capture_output=True, text=True,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return "stopped" in result.stdout
 
 
 def _message(text: str) -> None:
@@ -467,36 +512,28 @@ def _message(text: str) -> None:
         print(text)
 
 
-def launch_background(quiet: bool = False) -> None:
-    """Start the server with no window, then say where to point the tablet."""
+def _saved_port() -> int:
     try:
-        STATUS_PATH.unlink()
-    except OSError:
-        pass
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
-    subprocess.Popen(background_command(), creationflags=flags, close_fds=True, cwd=str(core.BASE_DIR))
-    for _ in range(40):
-        if STATUS_PATH.exists():
-            break
-        time.sleep(0.25)
+        return configured_port(core.load_config())
+    except SystemExit:
+        return DEFAULT_PORT
+
+
+def launch_background(quiet: bool = False) -> None:
+    """The Start menu shortcut: start the server, then say where to point the tablet."""
+    port = _saved_port()
+    running = start_background(port)
     if quiet:
         return
-    time.sleep(0.2)
-    if STATUS_PATH.exists():
-        _message(STATUS_PATH.read_text(encoding="utf-8") + "\n\nIt keeps running in the background. "
+    if running:
+        _message(f"Running.\nOn the tablet, open: http://{lan_address()}:{port}\n\nIt keeps running in the background. "
                  "Use \"Stop Tablet Display\" to turn it off.")
     else:
         _message("The tablet display did not start. Details may be in tablet.log.")
 
 
 def stop_background() -> None:
-    script = ("$p = Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne " + str(os.getpid()) +
-              r" -and $_.Name -match '^(ScheduleManager|pythonw?)\.exe$' "
-              r"-and $_.CommandLine -match '(--tablet(\s|$)|tablet_server\.py)' }; "
-              "if ($p) { $p | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; 'stopped' } else { 'none' }")
-    result = subprocess.run(["powershell", "-NoProfile", "-Command", script], capture_output=True, text=True,
-                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    _message("Tablet display stopped." if "stopped" in result.stdout else "It was not running.")
+    _message("Tablet display stopped." if stop_processes() else "It was not running.")
 
 
 if __name__ == "__main__":

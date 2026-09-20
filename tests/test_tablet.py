@@ -2,6 +2,8 @@
 Run:  .venv\\Scripts\\python.exe -m unittest tests.test_tablet -v"""
 import re
 import sys
+import tempfile
+import time
 import threading
 import unittest
 import urllib.error
@@ -226,3 +228,76 @@ class FeedAndServerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ControlTests(unittest.TestCase):
+    """Starting, stopping and asking about the display, as the Settings page does."""
+
+    def test_configured_port(self):
+        self.assertEqual(ts.configured_port({}), ts.DEFAULT_PORT)
+        self.assertEqual(ts.configured_port({"tablet_port": 9000}), 9000)
+        self.assertEqual(ts.configured_port({"tablet_port": "abc"}), ts.DEFAULT_PORT)
+        self.assertEqual(ts.configured_port(None), ts.DEFAULT_PORT)
+
+    def test_background_command_names_the_port(self):
+        command = ts.background_command(9123)
+        self.assertEqual(command[-2:], ["--port", "9123"])
+        self.assertTrue(command[1].endswith("tablet_server.py"))
+
+    def test_status_reports_the_address_and_whether_it_answers(self):
+        feed = ts.Feed(make_config(), interval=30)
+        server = ts.Server(("127.0.0.1", 0), ts.make_handler(feed))
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            up = ts.tablet_status(port)
+            self.assertTrue(up["running"])
+            self.assertEqual(up["url"], f"http://{up['ip']}:{port}")
+            self.assertEqual(up["port"], port)
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertFalse(ts.tablet_status(port)["running"])
+
+    def test_the_address_is_an_ipv4_address(self):
+        parts = ts.lan_address().split(".")
+        self.assertEqual(len(parts), 4)
+        self.assertTrue(all(p.isdigit() and 0 <= int(p) <= 255 for p in parts))
+
+    def test_stopping_when_nothing_runs_says_so(self):
+        self.assertFalse(ts.stop_processes(59321))
+
+    def test_start_and_stop_a_real_background_server(self):
+        """Uses an unusual port and an isolated data folder, so a display that is really running is left alone."""
+        import os
+        import shutil
+        import socket
+        tmp = tempfile.TemporaryDirectory()
+        data = Path(tmp.name)
+        shutil.copy(Path(__file__).resolve().parent.parent / "config.example.json", data / "config.json")
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        saved_env, saved_status = os.environ.get("SCHEDULE_MANAGER_DATA"), ts.STATUS_PATH
+        os.environ["SCHEDULE_MANAGER_DATA"] = str(data)
+        ts.STATUS_PATH = data / "tablet_status.txt"
+        try:
+            self.assertFalse(ts.already_running(port))
+            self.assertTrue(ts.start_background(port))
+            self.assertTrue(ts.tablet_status(port)["running"])
+            self.assertTrue(ts.start_background(port))          # already running is fine
+            self.assertTrue(ts.stop_processes(port))
+            end = time.time() + 10
+            while ts.already_running(port) and time.time() < end:
+                time.sleep(0.3)
+            self.assertFalse(ts.already_running(port))
+            self.assertFalse(ts.stop_processes(port))
+        finally:
+            ts.stop_processes(port)
+            ts.STATUS_PATH = saved_status
+            if saved_env is None:
+                os.environ.pop("SCHEDULE_MANAGER_DATA", None)
+            else:
+                os.environ["SCHEDULE_MANAGER_DATA"] = saved_env
+            time.sleep(0.5)
+            tmp.cleanup()

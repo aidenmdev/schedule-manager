@@ -31,6 +31,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 import dominos_schedule as core
 import sync
+import tablet_server
 import updater
 from month_view import MonthGrid, month_grid_bounds
 from timeline_view import DayTimeline
@@ -2926,13 +2927,15 @@ class SettingsPage(Page):
         self.job_rows = []
         self._stamp = None
 
-    TABS = ["General", "Jobs & pay", "Alerts", "Data"]
+    TABS = ["General", "Jobs & pay", "Alerts", "Tablet", "Data"]
 
     def _show_tab(self, name):
         for frame in self.tab_frames.values():
             frame.pack_forget()
         self.tab_frames[name].pack(fill="x")
         self.scroll._parent_canvas.yview_moveto(0)
+        if name == "Tablet" and hasattr(self, "tablet_state"):
+            self.refresh_tablet()
 
     def on_show(self):
         """The form is built once, and again only after the settings have changed underneath it."""
@@ -3068,6 +3071,27 @@ class SettingsPage(Page):
         self.sync_lbl.grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
         self.show_sync_status()
 
+        self._tab = self.tab_frames["Tablet"]
+        b = self._section("Tablet display", "Shows your week on a tablet or any browser on your home Wi-Fi. It is read-only and "
+                          "doesn't show pay. It keeps running in the background, even after you close this app, until you stop it here.")
+        self.tablet_state = label(b, "Checking...", 15, "bold", anchor="w")
+        self.tablet_state.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 2))
+        self.tablet_url = label(b, "", 22, "bold", C["accent_hover"], anchor="w")
+        self.tablet_url.grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 2))
+        self.tablet_hint = label(b, "", 12, color=C["muted"], wraplength=820, justify="left", anchor="w")
+        self.tablet_hint.grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, 10))
+        row = ctk.CTkFrame(b, fg_color="transparent")
+        row.grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        self.tablet_start_btn = button(row, "Start", self.start_tablet, "primary", width=110)
+        self.tablet_start_btn.pack(side="left", padx=(0, 8))
+        self.tablet_stop_btn = button(row, "Stop", self.stop_tablet, "normal", width=110)
+        self.tablet_stop_btn.pack(side="left", padx=(0, 8))
+        self.tablet_copy_btn = button(row, "Copy address", self.copy_tablet_address, "normal", width=140)
+        self.tablet_copy_btn.pack(side="left")
+        self._field(b, 4, "tablet_port", "Port", tablet_server.configured_port(cfg), width=100,
+                    hint="Only change this if something else on this computer already uses it. Save, then stop and start the display.")
+        self._show_tablet(None)
+
         self._tab = self.tab_frames["Data"]
         b = self._section("Connection & data", "Everything for this computer is stored in one folder. Settings and history also sync through your Google account.")
         self.conn_lbl = label(b, "", 12, color=C["muted"], wraplength=700, justify="left", anchor="w")
@@ -3105,6 +3129,67 @@ class SettingsPage(Page):
         for k in ("name", "match", "wage", "brk", "remove"):
             rec[k].destroy()
         self.job_rows.remove(rec)
+
+    def _tablet_port(self) -> int:
+        try:
+            port = int(self.vars["tablet_port"].get().strip())
+            return port if 1024 <= port <= 65535 else tablet_server.configured_port(self.app.config_data)
+        except (KeyError, ValueError, tk.TclError):
+            return tablet_server.configured_port(self.app.config_data)
+
+    def _show_tablet(self, status):
+        """status: what tablet_server.tablet_status returned, or None while it is being checked."""
+        self._tablet_status = status
+        if status is None:
+            self.tablet_state.configure(text="Checking...", text_color=C["muted"])
+            self.tablet_url.configure(text="")
+            self.tablet_hint.configure(text="")
+            return
+        running, ip = status["running"], status["ip"]
+        self.tablet_state.configure(text="Running" if running else "Stopped", text_color=C["success"] if running else C["muted"])
+        if ip.startswith("127."):
+            self.tablet_url.configure(text="No network found")
+            self.tablet_hint.configure(text="Connect this computer to your Wi-Fi, then check again.")
+        else:
+            self.tablet_url.configure(text=status["url"])
+            self.tablet_hint.configure(text=(
+                "On the tablet's browser, type this address. The tablet has to be on the same Wi-Fi as this computer, and "
+                "this computer has to stay on and awake." if running else
+                "This is the address the tablet will use once you press Start. This computer's address can change after "
+                "a restart; if it does, the number above updates."))
+        self.tablet_start_btn.configure(state="disabled" if running else "normal")
+        self.tablet_stop_btn.configure(state="normal" if running else "disabled")
+        self.tablet_copy_btn.configure(state="disabled" if ip.startswith("127.") else "normal")
+
+    def refresh_tablet(self):
+        port = self._tablet_port()
+        self.app.run_async(lambda: tablet_server.tablet_status(port), self._show_tablet, lambda _e: None)
+
+    def start_tablet(self):
+        port = self._tablet_port()
+        self.tablet_state.configure(text="Starting...", text_color=C["warning"])
+        self.tablet_start_btn.configure(state="disabled")
+
+        def done(ok):
+            if not ok:
+                self.app.toast("The tablet display didn't start. Details are in tablet.log in the app folder.", "error", 7000)
+            self.refresh_tablet()
+
+        self.app.run_async(lambda: tablet_server.start_background(port), done, lambda e: (self.app.toast(friendly_error(e), "error"), self.refresh_tablet()))
+
+    def stop_tablet(self):
+        port = self._tablet_port()
+        self.tablet_state.configure(text="Stopping...", text_color=C["warning"])
+        self.tablet_stop_btn.configure(state="disabled")
+        self.app.run_async(lambda: tablet_server.stop_processes(port), lambda _r: self.refresh_tablet(),
+                           lambda e: (self.app.toast(friendly_error(e), "error"), self.refresh_tablet()))
+
+    def copy_tablet_address(self):
+        status = getattr(self, "_tablet_status", None)
+        if status:
+            self.clipboard_clear()
+            self.clipboard_append(status["url"])
+            self.app.toast("Address copied.", "success")
 
     def show_sync_status(self):
         if not hasattr(self, "sync_lbl"):
@@ -3167,6 +3252,9 @@ class SettingsPage(Page):
                 if r["brk"].get():
                     brk.append(name)
             raw.update({"job_match": job_match, "job_wages": job_wages, "break_ok_categories": brk})
+            port = self._port(g("tablet_port"))
+            if port != tablet_server.DEFAULT_PORT or "tablet_port" in raw:  # don't add a setting nobody changed
+                raw["tablet_port"] = port
             from zoneinfo import ZoneInfo
             ZoneInfo(raw["timezone"])
         except (ValueError, KeyError) as e:
@@ -3179,6 +3267,13 @@ class SettingsPage(Page):
         self.app.reload_config()
         self.app.toast("Settings saved.", "success")
         self.app.request_sync()
+
+    @staticmethod
+    def _port(text: str) -> int:
+        port = int(text or tablet_server.DEFAULT_PORT)
+        if not 1024 <= port <= 65535:
+            raise ValueError("the tablet port must be between 1024 and 65535")
+        return port
 
     @staticmethod
     def _nonneg(text: str, maximum: float) -> float:
@@ -3350,6 +3445,7 @@ class HelpPage(Page):
         "Works offline, backs itself up daily, and refreshes while you leave it open.",
         "Settings and import history sync between computers through your Google account (Settings > General).",
         "Updates: publish from your main computer and every other install offers it here under Updates.",
+        "Settings > Tablet starts and stops the tablet display and shows the address to type on the tablet.",
     ]
 
     def show_update_status(self):
