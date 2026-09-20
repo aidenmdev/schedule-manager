@@ -38,5 +38,6 @@
   "break_ok_categories": [
     "Dominos"
   ],
-  "display_name": ""
+  "display_name": "",
+  "tablet_port": 8765
 }

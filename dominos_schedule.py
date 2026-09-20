@@ -14,6 +14,7 @@ Other commands:
     python dominos_schedule.py undo                  # undo the most recent import
     python dominos_schedule.py reset                 # undo EVERYTHING this tool has ever done
     python dominos_schedule.py history                # show a log of everything imported/undone
+    python dominos_schedule.py sync                   # sync settings and history with your other computers
     python dominos_schedule.py check                  # verify auth + config are working
 
 Also see schedule_gui.py for a point-and-click version of all of the above.
@@ -40,12 +41,34 @@ from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-BASE_DIR = Path(__file__).resolve().parent
+
+
+def resolve_dirs(frozen: bool, executable: str = "", bundle_dir: str = "", env=None, source_dir=None) -> tuple:
+    """(data folder, read-only resource folder). Running from source, both are this folder, so the whole
+    thing stays portable. The installed app keeps its data in %LOCALAPPDATA%\\Schedule Manager so
+    updating or moving the program files never touches it. SCHEDULE_MANAGER_DATA overrides the data folder."""
+    env = os.environ if env is None else env
+    override = env.get("SCHEDULE_MANAGER_DATA")
+    if frozen:
+        resources = Path(bundle_dir or Path(executable).parent)
+        data = Path(override) if override else Path(env.get("LOCALAPPDATA") or Path.home()) / "Schedule Manager"
+    else:
+        resources = Path(source_dir or Path(__file__).resolve().parent)
+        data = Path(override) if override else resources
+    return data, resources
+
+
+BASE_DIR, RESOURCE_DIR = resolve_dirs(getattr(sys, "frozen", False), sys.executable, getattr(sys, "_MEIPASS", ""))
+try:
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass
 CONFIG_PATH = BASE_DIR / "config.json"
-CONFIG_EXAMPLE_PATH = BASE_DIR / "config.example.json"
+CONFIG_EXAMPLE_PATH = RESOURCE_DIR / "config.example.json"
 TOKEN_PATH = BASE_DIR / "token.json"
 CREDENTIALS_PATH = BASE_DIR / "credentials.json"
 STATE_PATH = BASE_DIR / "state.json"
+PREFS_PATH = BASE_DIR / "gui_prefs.json"
 CACHE_DIR = BASE_DIR / ".cache"
 BACKUP_DIR = BASE_DIR / "backups"
 BACKUP_FILES = ("config.json", "state.json", "gui_prefs.json")
@@ -248,6 +271,7 @@ def load_config() -> dict:
 class StateStore:
     def __init__(self, path: Path):
         self.path = path
+        self.on_save = None  # the app sets this so a save can trigger a sync
         self.data = self._load()
 
     def _load(self) -> dict:
@@ -260,6 +284,8 @@ class StateStore:
 
     def save(self):
         write_json_atomic(self.path, self.data)
+        if self.on_save:
+            self.on_save()
 
     def is_imported(self, week_key: str) -> bool:
         return week_key in self.data["weeks"]
@@ -316,6 +342,10 @@ def get_credentials():
             "Missing Google API packages. Run:\n"
             "    pip install -r requirements.txt"
         )
+
+    bundled = RESOURCE_DIR / "credentials.json"
+    if not CREDENTIALS_PATH.exists() and bundled.exists() and bundled != CREDENTIALS_PATH:
+        shutil.copy(bundled, CREDENTIALS_PATH)  # the installer ships it so a new computer only has to sign in
 
     creds = None
     if TOKEN_PATH.exists():
@@ -1373,6 +1403,26 @@ def confirm(prompt: str, default_yes: bool = False) -> bool:
     return answer in ("y", "yes")
 
 
+def cmd_sync(args):
+    import sync
+    config = load_config()
+    if not sync.enabled(config):
+        print("Sync is turned off (sync_enabled is false in config.json).")
+        return
+    _, calendar = build_services()
+    result = sync.sync_once(calendar, tzname=config["timezone"])
+    if result.first_upload:
+        print("Uploaded this computer's settings and history. Other computers will pick them up when they sync.")
+    elif result.pulled:
+        print("Updated from your other computers: " + ", ".join(result.pulled) + ".")
+    elif result.pushed:
+        print("Sent this computer's changes to your other computers.")
+    else:
+        print("Already in sync.")
+    if result.interrupted:
+        print("(A file changed while syncing; run it again in a moment.)")
+
+
 def cmd_check(args):
     config = load_config()
     print("Config loaded OK.")
@@ -1994,6 +2044,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_history = sub.add_parser("history", help="Show a log of imports/deletes/undos")
     p_history.set_defaults(func=cmd_history)
 
+    p_sync = sub.add_parser("sync", help="Sync settings and import history with your other computers")
+    p_sync.set_defaults(func=cmd_sync)
+
     p_check = sub.add_parser("check", help="Verify config + Google auth are working")
     p_check.set_defaults(func=cmd_check)
 
@@ -2013,6 +2066,11 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _sync_quietly():
+    import sync
+    sync.sync_quietly()
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -2027,8 +2085,13 @@ def main():
             if not hasattr(args, attr):
                 setattr(args, attr, default)
 
+    changes_state = args.func in (cmd_import, cmd_delete, cmd_undo, cmd_reset)
     try:
+        if changes_state:
+            _sync_quietly()
         args.func(args)
+        if changes_state:
+            _sync_quietly()
     except KeyboardInterrupt:
         print("\nCancelled.")
         sys.exit(1)

@@ -72,10 +72,10 @@ class Env:
     def install(self):
         import schedule_gui as g
         self.g = g
-        pairs = [(core, "CONFIG_PATH", self.cfg_path), (core, "STATE_PATH", self.tmp / "state.json"),
+        pairs = [(core, "BASE_DIR", self.tmp), (core, "CONFIG_PATH", self.cfg_path), (core, "STATE_PATH", self.tmp / "state.json"),
                  (core, "CACHE_DIR", self.tmp / ".cache"), (core, "EMAIL_CACHE_PATH", self.tmp / ".cache" / "emails.json"),
                  (core, "EVENTS_CACHE_PATH", self.tmp / ".cache" / "events.json"), (core, "BACKUP_DIR", self.tmp / "backups"),
-                 (core, "TOKEN_PATH", self.tmp / "token.json"), (g, "PREFS_PATH", self.tmp / "gui_prefs.json"),
+                 (core, "TOKEN_PATH", self.tmp / "token.json"), (core, "PREFS_PATH", self.tmp / "gui_prefs.json"), (g, "PREFS_PATH", self.tmp / "gui_prefs.json"),
                  (g, "LOG_PATH", self.tmp / "app.log"), (g, "BASE", self.tmp), (core, "build_services", lambda: (self.gmail, self.cal))]
         for mod, name, val in pairs:
             self._saved[(mod, name)] = getattr(mod, name)

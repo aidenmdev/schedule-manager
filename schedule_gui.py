@@ -9,10 +9,12 @@ from __future__ import annotations
 import ctypes
 import functools
 import gc
+import hashlib
 import json
 import math
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -21,21 +23,24 @@ import traceback
 import webbrowser
 import tkinter as tk
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from tkinter import filedialog, ttk
 
 import customtkinter as ctk
 from PIL import Image
 
 import dominos_schedule as core
+import sync
+import updater
 from month_view import MonthGrid, month_grid_bounds
 from timeline_view import DayTimeline
 from week_view import WeekGrid
 
 BASE = core.BASE_DIR
-PREFS_PATH = BASE / "gui_prefs.json"
+PREFS_PATH = core.PREFS_PATH
 LOG_PATH = BASE / "app.log"
-ICON_ICO = BASE / "app.ico"
-ICON_PNG = BASE / "app_icon.png"
+ICON_ICO = core.RESOURCE_DIR / "app.ico"
+ICON_PNG = core.RESOURCE_DIR / "app_icon.png"
 
 C = {
     "bg": "#0d1017", "sidebar": "#111520", "card": "#171c2b", "card2": "#1f2538", "border": "#2a3147",
@@ -111,13 +116,15 @@ def friendly_error(e: BaseException) -> str:
 
 
 MUTEX_NAME = "ScheduleManager.v2.SingleInstance"
+if os.environ.get("SCHEDULE_MANAGER_DATA"):  # a copy with its own data folder (for testing) is its own instance
+    MUTEX_NAME += "." + hashlib.md5(os.path.normcase(os.environ["SCHEDULE_MANAGER_DATA"]).encode()).hexdigest()[:8]
 _mutex_handle = None  # kept alive for the whole process so the mutex exists while the app runs
 
 
-def acquire_single_instance(name: str = MUTEX_NAME):
+def acquire_single_instance(name: str | None = None):
     """(is_first_instance, handle). Keep the handle alive for the life of the process."""
     try:
-        handle = ctypes.windll.kernel32.CreateMutexW(None, False, name)
+        handle = ctypes.windll.kernel32.CreateMutexW(None, False, name or MUTEX_NAME)
         already = ctypes.windll.kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
     except (AttributeError, OSError):
         return True, None
@@ -380,6 +387,15 @@ class App(ctk.CTk):
         self.store = None
         self.report_cache = {}
         self._toast = None
+        self._sync_running = False
+        self._sync_again = False
+        self._sync_timer = None
+        self._sync_last_ok = 0.0
+        self._sync_last_error = ""
+        self.sync_text = ""
+        self.update_check = None
+        self.update_text = ""
+        self._update_running = False
         self._load_config()
         self._build_ui()
         self.show_page("dashboard")
@@ -397,7 +413,11 @@ class App(ctk.CTk):
         self.bind_all("<TouchpadScroll>", self._on_touchpad, add="+")
         self.after(150, self._poll)
         self.after(400, self._startup)
+        self.after(self.SYNC_EVERY_MS, self._periodic_sync)
+        self.bind("<FocusIn>", self._on_focus, add="+")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    SYNC_EVERY_MS = 6 * 60 * 1000
 
     PAGES = {"dashboard": "DashboardPage", "week": "WeekPage", "month": "MonthPage", "plan": "PlanPage",
              "earnings": "EarningsPage", "import": "ImportPage", "manage": "ManagePage", "report": "ReportPage",
@@ -422,6 +442,7 @@ class App(ctk.CTk):
         apply_accent(name)
         self.prefs["accent"] = name
         save_prefs(self.prefs)
+        self.request_sync()
         keep, account = self.current or "dashboard", self.account_lbl.cget("text")
         self.sidebar.destroy()
         self.content.destroy()
@@ -498,6 +519,10 @@ class App(ctk.CTk):
         if not core.CONFIG_PATH.exists() and core.CONFIG_EXAMPLE_PATH.exists():
             import shutil
             shutil.copy(core.CONFIG_EXAMPLE_PATH, core.CONFIG_PATH)
+            try:
+                sync.LocalFiles().forget_base()  # a rebuilt config is a fresh start: shared settings win over the template
+            except OSError:
+                pass
             self.after(800, lambda: self.toast("Created config.json from the template. Fill it in under Settings.", "warn"))
         try:
             self.config_data = core.load_config()
@@ -528,6 +553,254 @@ class App(ctk.CTk):
             self.store = fresh
         else:
             current.data, current.path = fresh.data, fresh.path
+        self.store.on_save = self._state_saved
+
+    def _state_saved(self):
+        """Called from whichever thread saved state.json; syncing is scheduled on the main thread."""
+        self.queue.put(("ok", lambda _result: self.request_sync(), None))
+
+    def request_sync(self, delay_ms: int = 2500):
+        """Sync soon, and just once if several changes arrive close together."""
+        if not sync.enabled(self.config_data):
+            return
+        if self._sync_timer is not None:
+            self.after_cancel(self._sync_timer)
+
+        def fire():
+            self._sync_timer = None
+            self.sync_now()
+        self._sync_timer = self.after(delay_ms, fire)
+
+    def _sync_service(self):
+        return core.build_services()[1]
+
+    def sync_now(self, manual: bool = False):
+        """Merge this computer with the shared copy in Google. Quiet unless something changed or `manual`."""
+        if not sync.enabled(self.config_data):
+            if manual:
+                self.toast("Sync is turned off on this computer.", "warn")
+            return
+        if self._sync_running:
+            self._sync_again = True
+            return
+        self._sync_running = True
+        tzname = self.config_data.get("timezone", "America/Los_Angeles")
+
+        def work():
+            return sync.sync_once(self._sync_service(), tzname=tzname)
+
+        def done(result):
+            self._sync_running = False
+            self._sync_finished(result, manual)
+            if self._sync_again:
+                self._sync_again = False
+                self.request_sync(1000)
+
+        def failed(err):
+            self._sync_running = False
+            self._sync_again = False
+            offline = core.is_network_error(err)
+            self.sync_text = "Offline. Will sync when the internet is back." if offline else f"Sync problem: {friendly_error(err)}"
+            self._update_sync_label()
+            if not offline and not isinstance(err, sync.SyncError):
+                log_error(f"sync failed: {err!r}")
+            message = friendly_error(err)
+            if manual or (not offline and message != self._sync_last_error):
+                self.toast("Sync: " + message, "warn" if offline else "error", 7000)
+            self._sync_last_error = "" if offline else message
+
+        self.run_async(work, done, failed, exclusive=True)
+
+    def _sync_finished(self, result, manual: bool):
+        self._sync_last_ok = time.time()
+        self._sync_last_error = ""
+        self.sync_text = f"Last synced {core.fmt_time(datetime.now())}."
+        if result.pulled:
+            self._apply_pulled(result.pulled)
+        if result.interrupted:
+            self.request_sync(1500)
+        if result.first_upload:
+            self.toast("Sync is on. Your settings and history are now saved in a private calendar called "
+                       "\"Schedule Manager sync data\" in your Google account.", "success", 9000)
+        elif result.pulled:
+            what = "Settings and history loaded from your Google account." if result.joined else \
+                "Updated from your other computers."
+            self.toast(what, "success")
+        elif manual:
+            self.toast("Already in sync.", "success")
+        self._update_sync_label()
+
+    def _apply_pulled(self, pulled, tries: int = 0):
+        if self.write_lock.locked() and tries < 20:
+            self.after(500, lambda: self._apply_pulled(pulled, tries + 1))
+            return
+        if "config" in pulled:
+            self.reload_config()
+        if "state" in pulled:
+            self.reload_store()
+        if "prefs" in pulled:
+            fresh = load_prefs()
+            old = self.prefs.get("accent", "Indigo")
+            self.prefs.update({k: fresh[k] for k in sync.SYNCED_PREFS if k in fresh})
+            new = self.prefs.get("accent", "Indigo")
+            if new != old and new in ACCENTS:
+                self.prefs["accent"] = old
+                self.set_accent(new)
+        self.invalidate()
+        page = self.pages.get(self.current)
+        if page is not None and self.current != "settings":
+            page.refresh()
+        elif page is not None:
+            page.on_show()
+
+    def _update_sync_label(self):
+        page = self.pages.get("settings")
+        if page is not None:
+            page.show_sync_status()
+
+    def _periodic_sync(self):
+        self.sync_now()
+        self.maybe_check_updates()
+        self.after(self.SYNC_EVERY_MS, self._periodic_sync)
+
+    def _update_service(self):
+        return core.build_services()[0]
+
+    def _install_dir(self) -> Path:
+        return Path(sys.executable).parent
+
+    def _tablet_running(self) -> bool:
+        try:
+            import tablet_server
+            return tablet_server.already_running(int((self.config_data or {}).get("tablet_port") or tablet_server.DEFAULT_PORT))
+        except Exception:
+            return False
+
+    def maybe_check_updates(self):
+        """At most twice a day, and never if the person turned it off."""
+        if not updater.is_installed() or not self.prefs.get("auto_check_updates", True):
+            return
+        if time.time() - float(self.prefs.get("last_update_check", 0)) < 12 * 3600:
+            return
+        self.check_updates()
+
+    def check_updates(self, manual: bool = False):
+        info = updater.read_build_info()
+        if not updater.is_installed() or info is None:
+            if manual:
+                self.toast("Updates are for the installed app. This copy runs straight from the source folder.", "warn")
+            return
+        if self._update_running:
+            return
+        self._update_running = True
+        self.update_text = "Checking..."
+        self._update_label()
+
+        def work():
+            return updater.find_updates(self._update_service(), info)
+
+        def done(check):
+            self._update_running = False
+            self.update_check = check
+            self.prefs["last_update_check"] = time.time()
+            save_prefs(self.prefs)
+            if check.available:
+                u = check.available
+                self.update_text = "Update available: " + updater.describe_build(updater.BuildInfo(u.version, u.build, u.base)) + "."
+                self.toast("A Schedule Manager update is available.", "info", 10000, action=("See it", self.offer_update))
+            elif check.needs_new_installer:
+                self.update_text = "A newer version exists, but it needs the latest Schedule Manager Setup file."
+                if manual:
+                    self.toast(self.update_text, "warn", 8000)
+            else:
+                self.update_text = "You're up to date."
+                if manual:
+                    self.toast("You're up to date.", "success")
+            self._update_label()
+
+        def failed(err):
+            self._update_running = False
+            offline = core.is_network_error(err)
+            self.update_text = "Offline, so it couldn't check for updates." if offline else f"Couldn't check for updates: {friendly_error(err)}"
+            self._update_label()
+            if manual:
+                self.toast(self.update_text, "warn" if offline else "error", 7000)
+
+        self.run_async(work, done, failed)
+
+    def offer_update(self):
+        check = self.update_check
+        update = check.available if check else None
+        if update is None:
+            self.check_updates(manual=True)
+            return
+        m = Modal(self, "Update Schedule Manager", width=540)
+        label(m.body, f"Version {update.version} is ready", 18, "bold").pack(anchor="w")
+        label(m.body, update.notes or "No notes were included.", 13, color=C["muted"], wraplength=480, justify="left").pack(anchor="w", pady=(8, 6))
+        label(m.body, f"About {max(update.size / 1e6, 0.1):.1f} MB to download. Schedule Manager will close, update, and open again by itself.",
+              12, color=C["muted"], wraplength=480, justify="left").pack(anchor="w", pady=(0, 14))
+        row = ctk.CTkFrame(m.body, fg_color="transparent")
+        row.pack(fill="x")
+        button(row, "Update now", lambda: m.close(True), "primary", width=130).pack(side="right")
+        button(row, "Later", lambda: m.close(False), "normal", width=100).pack(side="right", padx=8)
+        m.show()
+        if m.result:
+            self.install_update(update)
+
+    def install_update(self, update):
+        if self.write_lock.locked():
+            self.toast("Wait for the current task to finish, then try again.", "warn")
+            return
+        info = updater.read_build_info()
+        install_dir = self._install_dir()
+        work_dir = core.BASE_DIR / "update"
+
+        def work():
+            package = updater.download(self._update_service(), update)
+            shutil.rmtree(work_dir, ignore_errors=True)
+            key = updater.load_public_key(core.RESOURCE_DIR / updater.KEY_NAME)
+            return updater.stage(package, update, info, key, install_dir, work_dir / "stage")
+
+        def done(staged):
+            script = updater.apply_script(staged, install_dir, work_dir, os.getpid(), restart=True,
+                                          restart_tablet=self._tablet_running(), failure_note=core.BASE_DIR / "update_failed.txt")
+            self.toast("Updating. Schedule Manager will reopen in a moment.", "success", 6000)
+            self.after(800, lambda: self._relaunch(script))
+
+        self.run_job([], "Downloading the update...", work, done, exclusive=True)
+
+    def _relaunch(self, script):
+        if self.write_lock.locked():
+            self.after(1000, lambda: self._relaunch(script))
+            return
+        updater.launch(script)
+        self._on_close()
+
+    def _update_label(self):
+        page = self.pages.get("help")
+        if page is not None:
+            page.show_update_status()
+
+    def _after_update_notice(self):
+        failed = core.BASE_DIR / "update_failed.txt"
+        if failed.exists():
+            try:
+                failed.unlink()
+            except OSError:
+                pass
+            self.toast("The last update couldn't be installed, so the previous version was restored.", "warn", 9000)
+        info = updater.read_build_info()
+        if info is not None:
+            seen = self.prefs.get("seen_build")
+            if seen is not None and seen != info.build:
+                self.toast(f"Schedule Manager was updated to version {info.version}.", "success", 7000)
+            if seen != info.build:
+                self.prefs["seen_build"] = info.build
+                save_prefs(self.prefs)
+
+    def _on_focus(self, event):
+        if event.widget is self and time.time() - self._sync_last_ok > 120:
+            self.sync_now()
 
     def load_raw_config(self):
         """config.json as a dict for editing, or None (with an error shown) if it is damaged."""
@@ -627,7 +900,7 @@ class App(ctk.CTk):
             except SystemExit as e:
                 self.queue.put(("error", on_error, RuntimeError(str(e.code) if e.code else "Stopped")))
             except Exception as e:
-                if not core.is_network_error(e):  # offline is expected; don't log it
+                if not core.is_network_error(e) and not isinstance(e, sync.SyncError):  # expected problems aren't bugs
                     log_error(traceback.format_exc())
                 self.queue.put(("error", on_error, e))
 
@@ -754,6 +1027,9 @@ class App(ctk.CTk):
             log_error(f"auto backup failed: {e}")
         if self.config_data:
             self.pages["dashboard"].refresh(check_email=bool(self.prefs.get("auto_check_email", True)))
+            self.sync_now()
+        self._after_update_notice()
+        self.after(8000, self.maybe_check_updates)
 
     def _on_close(self):
         self.prefs["size"] = self.geometry().split("+")[0]
@@ -2691,6 +2967,21 @@ class SettingsPage(Page):
             self.auto_email.select()
         self.auto_email.grid(row=0, column=0, columnspan=3, sticky="w", pady=4)
 
+        b = self._section("Sync between computers",
+                          "Keeps your settings and import history the same on every computer signed in to this Google account. "
+                          "Your calendar events are already shared by Google Calendar. Sync uses a private calendar called "
+                          "\"Schedule Manager sync data\" (you can hide it, but please don't delete it).")
+        self.sync_switch = ctk.CTkSwitch(b, text="Sync this computer", progress_color=C["accent"], font=font(13),
+                                         command=self._toggle_sync)
+        if sync.enabled(self.app.config_data):
+            self.sync_switch.select()
+        self.sync_switch.grid(row=0, column=0, sticky="w", pady=4)
+        self.sync_now_btn = button(b, "Sync now", lambda: self.app.sync_now(manual=True), "normal", width=110)
+        self.sync_now_btn.grid(row=0, column=1, sticky="w", padx=(16, 0))
+        self.sync_lbl = label(b, "", 12, color=C["muted"], wraplength=700, justify="left", anchor="w")
+        self.sync_lbl.grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        self.show_sync_status()
+
         b = self._section("Connection & portability", "Everything lives in this folder, so you can copy it to another computer.")
         self.conn_lbl = label(b, "", 12, color=C["muted"], wraplength=700, justify="left", anchor="w")
         self.conn_lbl.grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
@@ -2728,9 +3019,34 @@ class SettingsPage(Page):
             rec[k].destroy()
         self.job_rows.remove(rec)
 
+    def show_sync_status(self):
+        if not hasattr(self, "sync_lbl"):
+            return
+        if not sync.enabled(self.app.config_data):
+            text = "Sync is off on this computer."
+        else:
+            text = self.app.sync_text or "Not synced yet since the app opened."
+        try:
+            self.sync_lbl.configure(text=text)
+        except tk.TclError:
+            pass
+
+    def _toggle_sync(self):
+        raw = self.app.load_raw_config()
+        if raw is None:
+            return
+        on = bool(self.sync_switch.get())
+        raw["sync_enabled"] = on
+        core.save_config(raw)
+        self.app.reload_config()
+        self.show_sync_status()
+        if on:
+            self.app.sync_now(manual=True)
+
     def _toggle_auto(self):
         self.app.prefs["auto_check_email"] = bool(self.auto_email.get())
         save_prefs(self.app.prefs)
+        self.app.request_sync()
 
     def save(self):
         raw = self.app.load_raw_config()
@@ -2775,6 +3091,7 @@ class SettingsPage(Page):
         core.save_config(raw)
         self.app.reload_config()
         self.app.toast("Settings saved.", "success")
+        self.app.request_sync()
 
     @staticmethod
     def _nonneg(text: str, maximum: float) -> float:
@@ -2846,6 +3163,15 @@ class SettingsPage(Page):
             self.app.toast(str(e), "error")
 
     def make_shortcut(self):
+        if getattr(sys, "frozen", False):
+            try:
+                import install_lib
+                install_lib.create_shortcut(install_lib.desktop_dir() / "Schedule Manager.lnk", sys.executable,
+                                            workdir=str(Path(sys.executable).parent), icon=sys.executable)
+                self.app.toast("Shortcut created on your Desktop.", "success")
+            except (OSError, subprocess.SubprocessError) as e:
+                self.app.toast(f"Couldn't create shortcut: {e}", "error")
+            return
         script = BASE / "create_shortcut.ps1"
         if not script.exists():
             self.app.toast("create_shortcut.ps1 is missing from the app folder.", "error")
@@ -2871,11 +3197,15 @@ class HelpPage(Page):
                  ("Ctrl + K", "Command palette: type what you want to do"), ("F5", "Refresh the current page"),
                  ("Drag in the Week view", "Move / resize an event, or drag empty space to add one"),
                  ("Mouse wheel / two-finger swipe", "Scroll anywhere"), ("Esc", "Close a dialog")]
-    MOVING = ["Copy the whole folder to the new computer (you can skip the .venv folder).",
+    MOVING = ["Run 'Schedule Manager Setup.exe' on the new computer, then open Schedule Manager and sign in to Google.",
+              "Your settings and import history load from your Google account on the first sync.",
+              "Running from the folder instead: copy it over (skip .venv), install Python 3.10+, and double-click 'Schedule Manager.vbs'."
+              ] if getattr(sys, "frozen", False) else [
+              "Copy the whole folder to the new computer (you can skip the .venv folder).",
               "Install Python 3.10 or newer from python.org (tick 'Add python.exe to PATH').",
               "Double-click 'Schedule Manager.vbs'. The first launch sets itself up (needs internet).",
               "Run 'Create Desktop Shortcut.bat' to get the Desktop and Start menu icons.",
-              "If Google asks you to sign in again, that's normal: your settings and history come with the folder."]
+              "If Google asks you to sign in again, that's normal. Settings and history sync from your Google account."]
 
     def __init__(self, master, app):
         super().__init__(master, app)
@@ -2910,12 +3240,56 @@ class HelpPage(Page):
         "Weekly email is now styled HTML (plain text is included too). Preview it from the Report page.",
         "Accent colors under Settings, short-rest alerts, an optional weekly hours goal.",
         "Works offline, backs itself up daily, and refreshes while you leave it open.",
+        "Settings and import history sync between computers through your Google account (Settings > Sync).",
+        "Updates: publish from your main computer and every other install offers it under About & help > Updates.",
     ]
+
+    def show_update_status(self):
+        if not hasattr(self, "update_lbl"):
+            return
+        available = bool(self.app.update_check and self.app.update_check.available)
+        installed = updater.is_installed()
+        text = self.app.update_text or ("" if installed else "Updates apply to the installed app.")
+        try:
+            self.update_lbl.configure(text=text)
+            self.update_check_btn.configure(state="normal" if installed else "disabled")
+            if available:
+                self.update_now_btn.grid()
+            else:
+                self.update_now_btn.grid_remove()
+        except tk.TclError:
+            pass
+
+    def _toggle_update_auto(self):
+        self.app.prefs["auto_check_updates"] = bool(self.update_auto.get())
+        save_prefs(self.app.prefs)
 
     def _build(self):
         b = self._section("What's new in v2")
         for line in self.WHATS_NEW:
             label(b, "\u2022  " + line, 13, color=C["muted"], wraplength=780, justify="left", anchor="w").pack(anchor="w", pady=2)
+
+        b = self._section("Updates")
+        info = updater.read_build_info() if updater.is_installed() else None
+        self.version_lbl = label(b, updater.describe_build(info) if info else
+                                 f"Version {core.APP_VERSION}. This copy runs from the source folder, so it doesn't update itself.",
+                                 13, color=C["muted"], anchor="w")
+        self.version_lbl.grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
+        label(b, "New versions are published from the computer where the code is changed and arrive through your own Gmail. "
+                 "Nothing is installed without you saying so.", 12, color=C["muted"], wraplength=760, justify="left",
+              anchor="w").grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 6))
+        self.update_auto = ctk.CTkSwitch(b, text="Look for updates automatically", progress_color=C["accent"], font=font(13),
+                                         command=self._toggle_update_auto)
+        if self.app.prefs.get("auto_check_updates", True):
+            self.update_auto.select()
+        self.update_auto.grid(row=2, column=0, sticky="w", pady=4)
+        self.update_check_btn = button(b, "Check for updates", lambda: self.app.check_updates(manual=True), "normal", width=160)
+        self.update_check_btn.grid(row=2, column=1, sticky="w", padx=(16, 0))
+        self.update_now_btn = button(b, "Update now", self.app.offer_update, "primary", width=120)
+        self.update_now_btn.grid(row=2, column=2, sticky="w", padx=(8, 0))
+        self.update_lbl = label(b, "", 12, color=C["muted"], wraplength=760, justify="left", anchor="w")
+        self.update_lbl.grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        self.show_update_status()
 
         b = self._section("Keyboard & mouse")
         for keys, what in self.SHORTCUTS:
@@ -2930,7 +3304,9 @@ class HelpPage(Page):
 
         b = self._section("Your data")
         latest = core.latest_backup()
-        rows = [("App folder", str(core.BASE_DIR)),
+        build = updater.read_build_info() if updater.is_installed() else None
+        rows = [("Version", updater.describe_build(build) if build else f"{core.APP_VERSION} (running from source)"),
+                ("App folder", str(core.BASE_DIR)),
                 ("Settings", "config.json   (edit under Settings)"),
                 ("History & imports", "state.json   (backed up automatically once a day)"),
                 ("Latest backup", latest.name if latest else "none yet"),
@@ -2962,7 +3338,8 @@ class HelpPage(Page):
             f"Schedule Manager v{core.APP_VERSION}", f"Python {platform.python_version()}  Tk {self.app.tk.call('info', 'patchlevel')}",
             f"Windows {platform.version()}  DPI scale {self.app.scale:.2f}", f"Folder: {BASE}",
             f"Jobs: {', '.join((cfg.get('job_match') or {}).keys())}  Timezone: {cfg.get('timezone')}",
-            f"Tracked weeks: {len(self.app.store.data['weeks'])}", "", "--- recent errors ---", log_tail])
+            f"Build: {updater.describe_build(updater.read_build_info()) if updater.is_installed() else 'source'}",
+            f"Tracked weeks: {len(self.app.store.data['weeks'])}", f"Sync: {self.app.sync_text or 'not run yet'}", "", "--- recent errors ---", log_tail])
 
     def copy_diagnostics(self):
         self.clipboard_clear()
@@ -2976,11 +3353,33 @@ class HelpPage(Page):
             self.app.toast("No errors have been logged. That's good news.", "success")
 
 
+HELPER_FLAGS = ("--uninstall", "--tablet", "--tablet-launch", "--tablet-stop")
+
+
+def run_helper(flag: str, rest: list) -> None:
+    """The installed exe doubles as its own uninstaller and as the tablet display, chosen by a flag."""
+    if flag == "--uninstall":
+        import install_lib
+        install_lib.uninstall_ui()
+    elif flag == "--tablet":
+        import tablet_server
+        tablet_server.main(rest)
+    elif flag == "--tablet-launch":
+        import tablet_server
+        tablet_server.launch_background(quiet="--quiet" in rest)
+    elif flag == "--tablet-stop":
+        import tablet_server
+        tablet_server.stop_background()
+
+
 def main():
     if sys.stdout is None:
         sys.stdout = open(os.devnull, "w")
     if sys.stderr is None:
         sys.stderr = open(os.devnull, "w")
+    if len(sys.argv) > 1 and sys.argv[1] in HELPER_FLAGS:
+        run_helper(sys.argv[1], sys.argv[2:])
+        return
     global _mutex_handle
     first, _mutex_handle = acquire_single_instance()
     if not first:

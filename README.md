@@ -25,7 +25,37 @@ Jobs are matched by words in the event title (for example `staples, work`), and 
 
 `Create Desktop Shortcut.bat` adds Desktop and Start menu shortcuts. The whole folder can be copied to another computer; `.venv` is rebuilt automatically.
 
-`token.json`, `credentials.json`, `config.json` and `state.json` stay on your machine and are not part of the repository.
+`token.json`, `credentials.json`, `config.json` and `state.json` stay on your machine and are not part of the repository, and neither is the built installer.
+
+## Updating your other computers
+
+Change the code on your main computer, then run `publish_update.bat "what changed"`. It rebuilds the program, works out which files changed since the installer (usually 3 files, about 8 MB), signs the update and emails it to your own Gmail. The subject starts with `[Schedule Manager update]`; you can file those messages away with a Gmail filter but please don't delete one until your other computers have updated.
+
+Each installed copy checks for an update when it opens (at most twice a day) and under About & help > Updates, where "Check for updates" and "Update now" do it on demand. Nothing installs without you choosing Update now. The app closes, a small helper swaps the files in, and it reopens by itself. If anything goes wrong, the previous version is put back and the app tells you.
+
+Updates are signed with a key made the first time you build (`release\update_signing_key.pem`). Copies of the app only accept updates signed by that key, so other mail can't install anything. Keep the `release` folder backed up: if it is lost, build a new installer and reinstall on your other computers once. The same applies whenever you run `build_installer.bat` again, because a new installer starts a new update line and older installs need the new setup file once. Copies that are running from the source folder don't update themselves.
+
+## Installing on another computer
+
+Run `build_installer.bat` once on a computer that has Python. It builds `dist\Schedule Manager Setup.exe` (about 40 MB), a normal installer for any Windows 10 or 11 computer, with no Python needed and no administrator rights. Copy that one file to the other computer and run it. It offers Desktop and Start menu shortcuts and an option to start the tablet display when you sign in, and it adds an entry to Settings > Apps so it can be uninstalled. For a script, `"Schedule Manager Setup.exe" /S` installs silently (`--dir`, `--no-desktop`, `--no-start-menu`, `--tablet-autostart` and `--no-launch` are also accepted). Running a newer setup file updates the program and leaves your data alone.
+
+If `credentials.json` is next to the app when you build, the installer includes it, so the new computer only has to sign in to Google. Treat the setup file as private for that reason. The installed program keeps its files in `%LOCALAPPDATA%\Schedule Manager`, separate from the program folder. Uninstalling asks whether to delete them too.
+
+## Using more than one computer
+
+Your calendar events are shared automatically because they live in Google Calendar. Settings, import history and undo information sync too. They are stored in a private calendar named "Schedule Manager sync data" in the same Google account (hidden from your calendar list; don't delete it).
+
+To add a computer: copy or clone this folder, put `credentials.json` next to the app, and open `Schedule Manager.vbs`. Sign in to Google when asked. The first sync loads your settings and history, so there's no need to copy `config.json`. After that, changes sync by themselves a few seconds after you make them, every few minutes, and whenever you switch back to the window. Settings > Sync shows the status and has a Sync now button. From the command line, `python dominos_schedule.py sync` does the same.
+
+Two computers can change different settings at the same time and both changes are kept. If both change the same setting, the newer edit wins. Deleting a week or undoing an import on one computer shows up on the others. A backup of your files is saved in `backups` before a sync ever replaces them. Turn syncing off per computer in Settings (`sync_enabled`, `tablet_port` and window size are never synced).
+
+## Tablet display
+
+Shows your week (read-only, no pay) on any device on your home Wi-Fi, such as an old tablet used as a wall calendar. The page is plain HTML and CSS so it works in old Android browsers, and it refreshes itself every few minutes.
+
+Double-click `Tablet Display.vbs`. It starts in the background with no window and pops up the address to open on the tablet, something like `http://192.168.1.20:8765`. Windows asks the first time whether Python may use your network; allow it on private networks. `Stop Tablet Display.bat` turns it off. `Tablet Auto-Start ON.bat` starts it quietly each time you sign in to Windows (`OFF` undoes that).
+
+The PC has to be on and awake for the tablet to show anything. Nothing is exposed to the internet, but anyone on your Wi-Fi can open the page. `tablet_port` in `config.json` changes the port (default 8765). If it doesn't start, look in `tablet.log`.
 
 ## Command line
 
@@ -42,6 +72,12 @@ python dominos_schedule.py -h
 .venv\Scripts\python.exe -m unittest tests.test_core
 .venv\Scripts\python.exe -m unittest tests.test_startup
 .venv\Scripts\python.exe -m unittest tests.test_gui
+.venv\Scripts\python.exe -m unittest tests.test_tablet
+.venv\Scripts\python.exe -m unittest tests.test_sync
+.venv\Scripts\python.exe -m unittest tests.test_installer
+.venv\Scripts\python.exe -m unittest tests.test_updater
+.venv\Scripts\python.exe -m unittest tests.test_gui_updates
+.venv\Scripts\python.exe -m unittest tests.test_gui_sync
 ```
 
 The tests use in-memory fakes for Gmail and Calendar and never touch a real account. `run_tests.bat` runs all of them. `tests/live_smoke.py` is a read-only check against your real account.

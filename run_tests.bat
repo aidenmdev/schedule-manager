@@ -9,10 +9,20 @@ if not exist ".venv\Scripts\python.exe" (
 echo === Core logic ===
 ".venv\Scripts\python.exe" -m unittest tests.test_core
 echo.
+echo === Syncing between computers ===
+".venv\Scripts\python.exe" -m unittest tests.test_sync
+".venv\Scripts\python.exe" -m unittest tests.test_installer
+".venv\Scripts\python.exe" -m unittest tests.test_updater
+echo.
+echo === Tablet page and server ===
+".venv\Scripts\python.exe" -m unittest tests.test_tablet
+echo.
 echo === App startup edge cases ===
 ".venv\Scripts\python.exe" -m unittest tests.test_startup
 echo.
 echo === The real app against fake Google (windows will flash open and closed) ===
 ".venv\Scripts\python.exe" -m unittest tests.test_gui
+".venv\Scripts\python.exe" -m unittest tests.test_gui_sync
+".venv\Scripts\python.exe" -m unittest tests.test_gui_updates
 echo.
 pause
