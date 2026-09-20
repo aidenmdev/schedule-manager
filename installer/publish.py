@@ -27,6 +27,9 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Publish an update to your other computers.")
     parser.add_argument("notes", nargs="?", default="", help="what changed (shown before installing)")
     parser.add_argument("--dry-run", action="store_true", help="build and save the package but don't email it")
+    parser.add_argument("--legacy", action="store_true",
+                        help="also send the old plain-zip copy, for installs that predate the encrypted format "
+                             "(Gmail bounces that copy back to you, which is harmless)")
     args = parser.parse_args(argv)
 
     baseline_path = build.RELEASE / "baseline.json"
@@ -53,11 +56,13 @@ def main(argv=None) -> int:
         return 0
 
     gmail, _ = core.build_services()
-    sent = updater.publish(gmail, package, manifest, private, progress=lambda i, n: print(f"  sent message {i} of {n}"))
+    sent = updater.publish(gmail, package, manifest, private, legacy=args.legacy,
+                           progress=lambda i, n: print(f"  sent message {i} of {n}"))
     state["ever_changed"] = sorted(ever_changed)
-    state["published"].append({"build": number, "version": info.version, "notes": notes, "messages": sent})
+    state["published"].append({"build": number, "version": info.version, "notes": notes, "messages": sent,
+                                "legacy": bool(args.legacy)})
     state_path.write_text(json.dumps(state, indent=1), encoding="utf-8")
-    print(f"Published. Your other computers will offer it the next time they check for updates.")
+    print("Published. Your other computers will offer it the next time they check for updates.")
     return 0
 
 

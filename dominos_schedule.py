@@ -297,15 +297,6 @@ class StateStore:
         self.data["weeks"][week_key] = entry
         self.data["imported_shift_keys"].extend(entry["shift_keys"])
 
-    def remove_week(self, week_key: str):
-        entry = self.data["weeks"].pop(week_key, None)
-        if entry:
-            keys = set(entry.get("shift_keys", []))
-            self.data["imported_shift_keys"] = [
-                k for k in self.data["imported_shift_keys"] if k not in keys
-            ]
-        return entry
-
     def log(self, action: str, **kwargs):
         self.data["history"].append(
             {"action": action, "timestamp": datetime.now().isoformat(timespec="seconds"), **kwargs}
@@ -417,11 +408,6 @@ def get_text_candidates(payload: dict) -> list:
 
     walk(payload)
     return plain + rich
-
-
-def get_plain_text(payload: dict) -> Optional[str]:
-    found = get_text_candidates(payload)
-    return found[0] if found else None
 
 
 @dataclass

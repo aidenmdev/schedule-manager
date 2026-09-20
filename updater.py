@@ -28,7 +28,10 @@ PART_BYTES = 9 * 1024 * 1024   # each email carries at most this much, before en
 BUILD_INFO_NAME = "build_info.json"
 KEY_NAME = "update_key.pub"
 NEVER_SHIPPED = frozenset({"credentials.json"})   # stays as installed on each computer
-MACHINE_LINE = re.compile(r"SM-UPDATE (\{.*\})")
+PACKAGE_TAG = "[Schedule Manager package]"   # current format: encrypted, so Gmail's scanner has nothing to object to
+MACHINE_LINE = re.compile(r"SM-UPDATE (\{.*\})")      # the first format: a plain zip, which Gmail refuses to deliver
+PACKAGE_LINE = re.compile(r"SM-PACKAGE (\{.*\})")
+SEAL_MAGIC = b"SMP1"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
@@ -150,25 +153,56 @@ def _wrapped_b64(data: bytes) -> str:
     return "\n".join(text[i:i + 76] for i in range(0, len(text), 76)) + "\n"
 
 
-def build_messages(package: bytes, manifest: dict, signature: str, to_addr: str) -> list:
-    """The emails that carry an update, as raw MIME bytes. The package is text so mail scanners leave it alone."""
+def transport_key(public_key) -> bytes:
+    """Both ends know the public key, so both can derive this. It only hides the package from mail scanners
+    (Gmail refuses to deliver a message whose attachment is a zip containing a program); the signature is what
+    protects you."""
+    from cryptography.hazmat.primitives import serialization
+    raw = public_key.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    return hashlib.sha256(b"schedule-manager-transport|" + raw).digest()
+
+
+def seal(package: bytes, key: bytes) -> bytes:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    nonce = os.urandom(12)
+    return SEAL_MAGIC + nonce + AESGCM(key).encrypt(nonce, package, SEAL_MAGIC)
+
+
+def unseal(data: bytes, key: bytes) -> bytes:
+    from cryptography.exceptions import InvalidTag
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    if not data.startswith(SEAL_MAGIC) or len(data) < len(SEAL_MAGIC) + 12 + 16:
+        raise UpdateError("The download is incomplete or damaged. Try again.")
+    nonce = data[len(SEAL_MAGIC):len(SEAL_MAGIC) + 12]
+    try:
+        return AESGCM(key).decrypt(nonce, data[len(SEAL_MAGIC) + 12:], SEAL_MAGIC)
+    except InvalidTag as e:
+        raise UpdateError("The download is damaged, or wasn't made by your build computer.") from e
+
+
+def build_messages(package: bytes, manifest: dict, signature: str, to_addr: str, key: Optional[bytes] = None) -> list:
+    """The emails that carry an update, as raw MIME bytes. With a `key` the package is encrypted (the normal way);
+    without one it goes as a plain zip, which older installs understand but Gmail complains about."""
     sha = hashlib.sha256(package).hexdigest()
-    parts = split_parts(package)
+    wire = seal(package, key) if key else package
+    parts = split_parts(wire)
+    tag, line = (PACKAGE_TAG, "SM-PACKAGE") if key else (SUBJECT_TAG, "SM-UPDATE")
     messages = []
     for index, chunk in enumerate(parts, start=1):
         meta = {"version": manifest["version"], "build": manifest["build"], "base": manifest["base"], "sha256": sha,
                 "size": len(package), "sig": signature, "part": index, "parts": len(parts)}
+        if key:
+            meta["enc"] = "aesgcm1"
         msg = MIMEMultipart()
         msg["To"] = to_addr
-        msg["Subject"] = (f"{SUBJECT_TAG} {manifest['version']} build {manifest['build']} "
-                          f"(part {index} of {len(parts)})")
+        msg["Subject"] = f"{tag} {manifest['version']} build {manifest['build']} (part {index} of {len(parts)})"
         body = (f"Schedule Manager {manifest['version']}\n\n{manifest.get('notes') or 'No notes.'}\n\n---\n"
                 "Your other computers use this message to update themselves. You can ignore it or file it away, "
-                "but please don't delete it until they have updated.\n\nSM-UPDATE " + json.dumps(meta, separators=(",", ":")) + "\n")
+                f"but please don't delete it until they have updated.\n\n{line} " + json.dumps(meta, separators=(",", ":")) + "\n")
         msg.attach(MIMEText(body, "plain", "utf-8"))
         attachment = MIMEText(_wrapped_b64(chunk), "plain", "us-ascii")
         attachment.add_header("Content-Disposition", "attachment",
-                              filename=f"update-{manifest['build']}-part{index}.txt")
+                              filename=f"{'package' if key else 'update'}-{manifest['build']}-part{index}.txt")
         msg.attach(attachment)
         messages.append(msg.as_bytes())
     return messages
@@ -186,12 +220,15 @@ def send_mime(gmail, mime: bytes) -> None:
 
 
 def publish(gmail, package: bytes, manifest: dict, private_key, to_addr: Optional[str] = None,
-            progress: Optional[Callable[[int, int], None]] = None) -> int:
-    """Email the update to yourself. Returns how many messages were sent."""
+            progress: Optional[Callable[[int, int], None]] = None, legacy: bool = False) -> int:
+    """Email the update to yourself. `legacy` also sends the old plain-zip copy for installs that predate the
+    encrypted format (Gmail will bounce that copy back to you, but the sent copy is still readable). Returns messages sent."""
     to_addr = to_addr or gmail.users().getProfile(userId="me").execute()["emailAddress"]
     sha = hashlib.sha256(package).hexdigest()
     signature = sign(private_key, manifest["build"], manifest["base"], sha)
-    messages = build_messages(package, manifest, signature, to_addr)
+    messages = build_messages(package, manifest, signature, to_addr, transport_key(private_key.public_key()))
+    if legacy:
+        messages += build_messages(package, manifest, signature, to_addr)
     for i, mime in enumerate(messages, start=1):
         send_mime(gmail, mime)
         if progress:
@@ -212,6 +249,7 @@ class Update:
     size: int
     total_parts: int
     parts: dict = field(default_factory=dict)   # part number -> (message id, attachment id)
+    enc: str = ""                               # "" = plain zip, otherwise how the package is sealed
 
     @property
     def complete(self) -> bool:
@@ -244,7 +282,7 @@ def _read_message(message: dict) -> Optional[tuple]:
             attachment_id = body.get("attachmentId")
         elif part.get("mimeType") == "text/plain" and body.get("data"):
             body_text += _decode_b64url(body["data"]).decode("utf-8", errors="replace")
-    found = MACHINE_LINE.search(body_text)
+    found = PACKAGE_LINE.search(body_text) or MACHINE_LINE.search(body_text)
     if not found or not attachment_id:
         return None
     try:
@@ -258,13 +296,13 @@ def _read_message(message: dict) -> Optional[tuple]:
 
 
 def find_updates(gmail, current: BuildInfo, limit: int = 60) -> UpdateCheck:
-    """Look through your own mail for update messages newer than this build."""
-    query = f'from:me subject:"{SUBJECT_TAG}" has:attachment'
+    """Look through your own mail (sent copies and the trash included) for update messages newer than this build."""
+    query = ('from:me (subject:"Schedule Manager package" OR subject:"Schedule Manager update") has:attachment')
     ids = []
     token = None
     while len(ids) < limit:
-        resp = gmail.users().messages().list(userId="me", q=query, maxResults=min(50, limit), pageToken=token).execute(
-            num_retries=core.RETRIES)
+        resp = gmail.users().messages().list(userId="me", q=query, maxResults=min(50, limit), pageToken=token,
+                                             includeSpamTrash=True).execute(num_retries=core.RETRIES)
         ids += [m["id"] for m in resp.get("messages", [])]
         token = resp.get("nextPageToken")
         if not token:
@@ -276,13 +314,15 @@ def find_updates(gmail, current: BuildInfo, limit: int = 60) -> UpdateCheck:
         if read is None:
             continue
         meta, notes, attachment_id = read
-        key = (int(meta["build"]), int(meta["base"]), meta["sha256"])
+        enc = str(meta.get("enc", ""))
+        key = (int(meta["build"]), int(meta["base"]), meta["sha256"], enc)
         update = updates.setdefault(key, Update(str(meta["version"]), int(meta["build"]), int(meta["base"]), notes,
-                                                meta["sha256"], meta["sig"], int(meta.get("size", 0)), int(meta["parts"])))
+                                                meta["sha256"], meta["sig"], int(meta.get("size", 0)), int(meta["parts"]),
+                                                enc=enc))
         update.parts[int(meta["part"])] = (mid, attachment_id)
     check = UpdateCheck(current)
-    for update in sorted(updates.values(), key=lambda u: u.build, reverse=True):
-        if update.build <= current.build or not update.complete:
+    for update in sorted(updates.values(), key=lambda u: (u.build, u.enc != ""), reverse=True):
+        if update.build <= current.build or not update.complete or update.enc not in ("", "aesgcm1"):
             continue
         if update.base == current.base:
             check.available = update
@@ -292,7 +332,8 @@ def find_updates(gmail, current: BuildInfo, limit: int = 60) -> UpdateCheck:
     return check
 
 
-def download(gmail, update: Update, progress: Optional[Callable[[int, int], None]] = None) -> bytes:
+def download(gmail, update: Update, progress: Optional[Callable[[int, int], None]] = None, public_key=None) -> bytes:
+    """The update package. Encrypted updates need `public_key` (the one shipped inside the app)."""
     chunks = []
     for number in sorted(update.parts):
         message_id, attachment_id = update.parts[number]
@@ -305,7 +346,12 @@ def download(gmail, update: Update, progress: Optional[Callable[[int, int], None
             raise UpdateError("The update message is damaged. Ask the build computer to publish it again.") from e
         if progress:
             progress(number, update.total_parts)
-    return b"".join(chunks)
+    data = b"".join(chunks)
+    if update.enc:
+        if public_key is None:
+            raise UpdateError("This update is encrypted and no key was available to open it.")
+        data = unseal(data, transport_key(public_key))
+    return data
 
 
 # ---- checking and staging ---------------------------------------------------------------------------------

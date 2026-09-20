@@ -16,6 +16,7 @@ echo === Syncing between computers ===
 echo.
 echo === Tablet page and server ===
 ".venv\Scripts\python.exe" -m unittest tests.test_tablet
+".venv\Scripts\python.exe" -m unittest tests.test_scroll
 echo.
 echo === App startup edge cases ===
 ".venv\Scripts\python.exe" -m unittest tests.test_startup

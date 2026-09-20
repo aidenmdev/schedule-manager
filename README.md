@@ -29,7 +29,7 @@ Jobs are matched by words in the event title (for example `staples, work`), and 
 
 ## Updating your other computers
 
-Change the code on your main computer, then run `publish_update.bat "what changed"`. It rebuilds the program, works out which files changed since the installer (usually 3 files, about 8 MB), signs the update and emails it to your own Gmail. The subject starts with `[Schedule Manager update]`; you can file those messages away with a Gmail filter but please don't delete one until your other computers have updated.
+Change the code on your main computer, then run `publish_update.bat "what changed"`. It rebuilds the program, works out which files changed since the installer (usually 3 files, about 8 MB), signs the update and emails it to your own Gmail. The subject starts with `[Schedule Manager package]` and the attachment is encrypted, because Gmail refuses to deliver a message with a plain zip of a program in it. You can file those messages away with a Gmail filter, but please don't delete one until your other computers have updated. (Copies installed before the encrypted format only understand the older `[Schedule Manager update]` messages; `publish_update.bat --legacy "notes"` also sends that older kind once, and Gmail bounces it back to you with a notice that can be ignored.)
 
 Each installed copy checks for an update when it opens (at most twice a day) and under About & help > Updates, where "Check for updates" and "Update now" do it on demand. Nothing installs without you choosing Update now. The app closes, a small helper swaps the files in, and it reopens by itself. If anything goes wrong, the previous version is put back and the app tells you.
 
@@ -72,6 +72,7 @@ python dominos_schedule.py -h
 .venv\Scripts\python.exe -m unittest tests.test_core
 .venv\Scripts\python.exe -m unittest tests.test_startup
 .venv\Scripts\python.exe -m unittest tests.test_gui
+.venv\Scripts\python.exe -m unittest tests.test_scroll
 .venv\Scripts\python.exe -m unittest tests.test_tablet
 .venv\Scripts\python.exe -m unittest tests.test_sync
 .venv\Scripts\python.exe -m unittest tests.test_installer
@@ -80,6 +81,6 @@ python dominos_schedule.py -h
 .venv\Scripts\python.exe -m unittest tests.test_gui_sync
 ```
 
-The tests use in-memory fakes for Gmail and Calendar and never touch a real account. `run_tests.bat` runs all of them. `tests/live_smoke.py` is a read-only check against your real account.
+The tests use in-memory fakes for Gmail and Calendar and never touch a real account, and their windows are invisible and off screen (`python -m tests.screenshots OUT_DIR` saves a picture of each page the same way). `run_tests.bat` runs all of them. `tests/live_smoke.py` is a read-only check against your real account.
 
 Not affiliated with Domino's.

@@ -130,8 +130,8 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(sync.synced_config(cfg), {"a": 1})
 
     def test_only_chosen_prefs_travel(self):
-        self.assertEqual(sync.synced_prefs({"accent": "Rose", "size": "800x600", "plan_goal": 5}),
-                         {"accent": "Rose", "plan_goal": 5})
+        self.assertEqual(sync.synced_prefs({"plan_title": "Read", "size": "800x600", "plan_goal": 5}),
+                         {"plan_title": "Read", "plan_goal": 5})
 
     def test_encode_round_trip(self):
         doc = {"format": 1, "x": ["é", 1, {"y": None}]}
@@ -175,7 +175,7 @@ class SyncFlowTests(unittest.TestCase):
         a = self.computer("A", config=dict(self.cfg, job_wages={"Dominos": 17.58}),
                           state={"history": [history_entry("import", "2026-09-19T10:00:00", "2026-09-21", ["x"])],
                                  "weeks": {"2026-09-21": week_entry("2026-09-21", ["x"])}},
-                          prefs={"accent": "Rose", "size": "1000x700"})
+                          prefs={"plan_title": "Read", "size": "1000x700"})
         a.sync(self.acct)
         b = self.computer("B", config=make_config(sync_enabled=True, job_wages={"Dominos": 0}, tablet_port=9999),
                           prefs={"size": "1500x900"})
@@ -186,7 +186,7 @@ class SyncFlowTests(unittest.TestCase):
         self.assertEqual(b.read("config")["tablet_port"], 9999)           # stays this computer's own
         self.assertEqual(b.read("state")["weeks"]["2026-09-21"]["event_ids"], ["x"])
         self.assertEqual(len(b.read("state")["history"]), 1)
-        self.assertEqual(b.read("prefs"), {"size": "1500x900", "accent": "Rose"})
+        self.assertEqual(b.read("prefs"), {"size": "1500x900", "plan_title": "Read"})
 
     def test_joining_keeps_a_backup_of_what_it_replaced(self):
         a = self.computer("A", config=dict(self.cfg, display_name="Original"))

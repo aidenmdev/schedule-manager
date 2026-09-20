@@ -240,8 +240,9 @@ class GuiTests(unittest.TestCase):
         for _ in range(4):
             child.event_generate("<TouchpadScroll>", x=10, y=10, delta=((-30) & 0xFFFF))
             self.app.update()
+        self.pump(0.6)
         self.assertGreater(canvas.yview()[0], 0.05)
-        self.assertIsNone(self.g.App.touch_target(self.app.pages["history"].tree))
+        self.assertIsNone(self.g.App.touch_target(self.app.pages["manage"].tree))
 
     def test_11b_offline_mode(self):
         d = self.app.pages["dashboard"]
@@ -471,7 +472,6 @@ class GuiTests(unittest.TestCase):
         self.no_errors()
 
     def test_14_settings_actions(self):
-        from unittest import mock
         sp = self.app.pages["settings"]
         self.app.show_page("settings")
         self.pump(1.0)
@@ -973,50 +973,74 @@ class GuiTests(unittest.TestCase):
         self.assertTrue(self.app.config_data["email_html"])
         self.no_errors()
 
-    def test_29_accent_colors(self):
+    def test_29_new_layout_has_no_theme_picker_or_history(self):
         g = self.g
-        original = dict(g.C)
-        try:
-            self.app.show_page("dashboard")
-            self.pump(2.0)
-            old_pages = dict(self.app.pages)
-            self.app.set_accent("Emerald")
-            self.pump(2.5)
-            self.assertEqual(g.C["accent"], g.ACCENTS["Emerald"][0])
-            self.assertIsNot(self.app.pages["dashboard"], old_pages["dashboard"])      # rebuilt with the new color
-            self.assertFalse(old_pages["dashboard"].winfo_exists())
-            self.assertEqual(self.app.current, "dashboard")
-            self.assertEqual(self.app.nav_bars["dashboard"].cget("fg_color"), g.ACCENTS["Emerald"][0])
-            self.assertEqual(json.loads(g.PREFS_PATH.read_text(encoding="utf-8"))["accent"], "Emerald")
-            self.assertEqual(self.app.account_lbl.cget("text"), "test@example.com")     # sidebar state survives
-            # every page still opens, and the calendar widgets picked up the new color
-            for key, _t in g.App.NAV:
-                self.app.show_page(key)
-                self.pump(0.6)
-            self.assertEqual(self.app.pages["week"].grid_view.C["accent"], g.ACCENTS["Emerald"][0])
-            # a swatch click in Settings works (deferred so the button isn't destroyed mid-click)
-            self.app.show_page("settings")
-            self.pump(1.0)
-            self.app.set_accent("Rose")
-            self.pump(1.5)
-            self.assertEqual(g.C["accent"], g.ACCENTS["Rose"][0])
-            self.assertIn("Current: Rose", " ".join(w.cget("text") for w in find_widgets(self.app.pages["settings"], ctk.CTkLabel)))
-            # unknown names are ignored
-            self.app.set_accent("Nope")
-            self.assertEqual(g.C["accent"], g.ACCENTS["Rose"][0])
-        finally:
-            self.app.set_accent("Indigo")
-            self.pump(2.0)
-            self.assertEqual(g.C["accent"], original["accent"])
+        self.assertEqual([k for k, _t in g.App.NAV], ["dashboard", "week", "month", "plan", "earnings", "import",
+                                                       "manage", "report", "settings", "help"])
+        self.assertFalse(hasattr(g, "ACCENTS"))
+        self.assertFalse(hasattr(self.app, "set_accent"))
+        self.assertNotIn("history", self.app.nav_buttons)
+        with self.assertRaises(KeyError):
+            self.app.pages["history"]
+        self.app.show_page("settings")
+        self.pump(0.8)
+        sp = self.app.pages["settings"]
+        texts = " ".join(str(getattr(w, "_text", "")) for w in find_widgets(sp, ctk.CTkLabel))
+        self.assertNotIn("Appearance", texts)
+        self.assertNotIn("accent", texts.lower())
+        self.assertEqual(list(sp.tab_frames), ["General", "Jobs & pay", "Alerts", "Data"])
         self.no_errors()
 
-    def test_12_history_and_reports(self):
-        hp = self.app.pages["history"]
-        self.app.show_page("history")
-        self.pump(0.8)
-        actions = [hp.tree.set(k, "action") for k in hp.tree.get_children()]
-        self.assertIn("import", actions)
-        self.assertRegex(hp.tree.set(hp.tree.get_children()[0], "ts"), r"^[A-Z][a-z]{2} \d{1,2}, \d{1,2}:\d\d [AP]M$")
+    def test_30_pages_build_once_and_settings_only_rebuild_when_config_changes(self):
+        self.app.show_page("settings")
+        self.pump(0.6)
+        sp = self.app.pages["settings"]
+        first = sp.vars["gmail_query"]
+        self.app.show_page("dashboard")
+        self.app.show_page("settings")
+        self.assertIs(sp.vars["gmail_query"], first)          # coming back doesn't rebuild the form
+        sp.save()
+        self.app.show_page("dashboard")
+        self.app.show_page("settings")
+        self.pump(0.4)
+        self.assertIsNot(sp.vars["gmail_query"], first)       # saving changed the settings, so the form was refreshed
+        self.no_errors()
+
+    def test_31_pages_are_created_when_first_needed(self):
+        pages = self.app.pages
+        self.assertIsNone(pages.get("nonexistent"))
+        self.assertIs(pages["week"], pages["week"])
+        with self.assertRaises(KeyError):
+            pages["nope"]
+
+    def test_32_tab_switching_shows_one_group_at_a_time(self):
+        self.app.show_page("settings")
+        self.pump(0.5)
+        sp = self.app.pages["settings"]
+        for name in sp.TABS:
+            sp._show_tab(name)
+            self.pump(0.2)
+            shown = [n for n, f in sp.tab_frames.items() if f.winfo_manager()]
+            self.assertEqual(shown, [name])
+        hp = self.app.pages["help"]
+        self.app.show_page("help")
+        self.pump(0.5)
+        for name in hp.TABS:
+            hp._show_tab(name)
+            self.assertEqual([n for n, f in hp.tab_frames.items() if f.winfo_manager()], [name])
+        sp._show_tab("General")
+        self.no_errors()
+
+    def test_33_window_opens_maximized_and_f11_is_fullscreen(self):
+        import types
+        calls = []
+        fake = types.SimpleNamespace(wm_state=lambda state: calls.append(state))
+        self.g.App._open_maximized(fake)
+        self.assertEqual(calls, ["zoomed"])
+        self.assertTrue(self.app.bind("<F11>"))
+
+    def test_12_reports(self):
+        self.assertRegex(self.g.fmt_stamp("2026-09-18T14:07:03"), r"^[A-Z][a-z]{2} \d{1,2}, \d{1,2}:\d\d [AP]M$")
         self.assertEqual(self.g.fmt_stamp("garbage"), "garbage")
         rp = self.app.pages["report"]
         self.app.show_page("report")

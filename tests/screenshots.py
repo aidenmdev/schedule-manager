@@ -1,13 +1,13 @@
-"""Save a PNG of every page (fake data, isolated config). Usage: python -m tests.screenshots OUT_DIR [page ...]"""
+"""Save a PNG of each page (fake data, isolated config) without showing a window.
+Usage: python -m tests.screenshots OUT_DIR [page ...] [scale=1.0]"""
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from PIL import ImageGrab
-
 import dominos_schedule as core
 from tests.gui_env import Env, pump
+from tests.snap import snap
 
 
 def main():
@@ -16,28 +16,23 @@ def main():
     opts = {a.split("=")[0]: a.split("=")[1] for a in sys.argv[2:] if "=" in a}
     pages = [a for a in sys.argv[2:] if "=" not in a]
     import customtkinter as ctk
-    if "scale" in opts:  # emulate a different display scaling, e.g. scale=1.0 for a 100% screen (this laptop is 1.5)
+    if "scale" in opts:  # emulate a different display scaling, e.g. scale=1.0 for a 100% screen
         ctk.set_window_scaling(float(opts["scale"]) / 1.5)
         ctk.set_widget_scaling(float(opts["scale"]) / 1.5)
     env = Env().install()
-    if 'accent' in opts:
-        env.g.apply_accent(opts['accent'])
     try:
         results = core.find_schedule_emails(env.gmail, env.cfg, 10)
         old = next(p for p in results if p.email_id == "old-week")
         core.perform_import(env.gmail, env.cal, env.cfg, core.StateStore(core.STATE_PATH), old,
                             send_report=False, log=lambda *_: None)
         app = env.g.App()
-        app.geometry(f"{opts['size']}+10+0" if "size" in opts else "+10+0")
-        print("scale factor in app:", app.scale, "size:", app.winfo_width(), app.winfo_height())
         pump(app, 3)
         for key, _t in env.g.App.NAV:
             if pages and key not in pages:
                 continue
             app.show_page(key)
-            pump(app, 2.5)
-            x, y, w, h = app.winfo_rootx(), app.winfo_rooty(), app.winfo_width(), app.winfo_height()
-            ImageGrab.grab(bbox=(x, y, x + w, y + h)).save(out / f"{key}.png")
+            pump(app, 1.5)
+            snap(app, out / f"{key}.png")
             print("saved", key)
         app.destroy()
     finally:

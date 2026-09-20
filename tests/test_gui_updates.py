@@ -157,7 +157,7 @@ class GuiUpdateTests(unittest.TestCase):
         original = app.toast
         app.toast = lambda text, *a, **k: (toasts.append(text), original(text, *a, **k))[1]
         app.install_update(app.update_check.available)
-        self.assertTrue(self.wait_for(app, lambda: any("not signed" in t for t in toasts)))
+        self.assertTrue(self.wait_for(app, lambda: any("not signed" in t or "wasn't made by your build computer" in t for t in toasts)))
         self.assertEqual(self.relaunched, [])
 
     def test_a_copy_running_from_source_does_not_update(self):

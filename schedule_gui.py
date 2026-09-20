@@ -27,7 +27,7 @@ from pathlib import Path
 from tkinter import filedialog, ttk
 
 import customtkinter as ctk
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 import dominos_schedule as core
 import sync
@@ -43,42 +43,120 @@ ICON_ICO = core.RESOURCE_DIR / "app.ico"
 ICON_PNG = core.RESOURCE_DIR / "app_icon.png"
 
 C = {
-    "bg": "#0d1017", "sidebar": "#111520", "card": "#171c2b", "card2": "#1f2538", "border": "#2a3147",
-    "text": "#e6e9f2", "muted": "#8b93a9", "accent": "#5b8cff", "accent_hover": "#7aa2ff",
-    "success": "#34d399", "warning": "#fbbf24", "danger": "#f87171", "danger_bg": "#b4232c",
-    "today_bg": "#1b2340", "select": "#2a3a66",
+    "bg": "#090c13", "sidebar": "#0c1018", "card": "#111725", "card2": "#19212f", "border": "#222b3d",
+    "text": "#eaeef7", "muted": "#8b96ab", "dim": "#5b667c",
+    "accent": "#6b8afd", "accent_hover": "#8aa1ff", "accent_soft": "#1b2645", "select": "#232f52", "today_bg": "#131b33",
+    "success": "#3fdc98", "warning": "#ffb454", "danger": "#ff6b74", "danger_bg": "#c02f3b",
 }
 cat_color = core.category_color
 
-ACCENTS = {  # name: (accent, accent hover, selected row, today highlight)
-    "Indigo": ("#5b8cff", "#7aa2ff", "#2a3a66", "#1b2340"),
-    "Emerald": ("#10b981", "#34d399", "#1c4a3b", "#16302b"),
-    "Violet": ("#8b5cf6", "#a78bfa", "#3b2d6b", "#231d3f"),
-    "Rose": ("#f43f5e", "#fb7185", "#5b2436", "#33202b"),
-    "Amber": ("#f59e0b", "#fbbf24", "#5b4315", "#33291a"),
-    "Cyan": ("#06b6d4", "#22d3ee", "#164e5b", "#15303a"),
-}
+NAV_ICONS = {"dashboard": "\ue80f", "week": "\ue8c0", "month": "\ue787", "plan": "\ue7be", "earnings": "\ue8c7",
+             "import": "\ue896", "manage": "\ue71d", "report": "\ue8a5", "settings": "\ue713", "help": "\ue897"}
+ICON_FONT_FILES = (r"C:\Windows\Fonts\SegoeIcons.ttf", r"C:\Windows\Fonts\segmdl2.ttf")
+WHEEL = {"px": 96}
 
 
-def apply_accent(name: str):
-    accent, hover, select, today = ACCENTS.get(name, ACCENTS["Indigo"])
-    C.update(accent=accent, accent_hover=hover, select=select, today_bg=today)
+@functools.lru_cache(maxsize=None)
+def icon_image(glyph: str, color: str, size: int = 20):
+    """A crisp icon from the Windows icon font as a CTkImage, or None if this computer doesn't have the font."""
+    for path in ICON_FONT_FILES:
+        if os.path.exists(path):
+            big = size * 4
+            img = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+            ImageDraw.Draw(img).text((big / 2, big / 2), glyph, font=ImageFont.truetype(path, int(big * 0.78)),
+                                     fill=color, anchor="mm")
+            return ctk.CTkImage(img, size=(size, size))
+    return None
 
-WHEEL = {"px": 110}
+
+class Scroller:
+    """Wheel and trackpad input pile up as a pending distance that is spent a little each frame, so scrolling stays
+    smooth and never falls behind, however many events arrive or however heavy the page is to redraw."""
+    FRAME_MS = 9
+
+    def __init__(self, root):
+        self.root = root
+        self.pending: dict = {}
+        self.running = False
+        self._job = None
+
+    def add(self, canvas, pixels: float):
+        try:
+            top, bottom = canvas.yview()
+        except tk.TclError:
+            return
+        if bottom - top >= 0.995:  # everything already fits
+            return
+        self.pending[canvas] = self.pending.get(canvas, 0.0) + pixels
+        if not self.running:
+            self.running = True
+            self._job = self.root.after(1, self._step)
+
+    def cancel(self):
+        if self._job is not None:
+            try:
+                self.root.after_cancel(self._job)
+            except tk.TclError:
+                pass
+        self.pending.clear()
+        self.running = False
+        self._job = None
+
+    def _step(self):
+        for canvas, left in list(self.pending.items()):
+            step = int(round(left * 0.3))
+            if step == 0:
+                step = 1 if left > 0.5 else -1 if left < -0.5 else 0
+            try:
+                before = canvas.yview()
+                if step:
+                    canvas.yview_scroll(step, "units")  # 1 unit = 1 pixel (yscrollincrement is 1)
+                after = canvas.yview()
+            except tk.TclError:
+                del self.pending[canvas]
+                continue
+            left -= step
+            if abs(left) < 0.5 or after == before:
+                del self.pending[canvas]
+            else:
+                self.pending[canvas] = left
+        if self.pending:
+            self._job = self.root.after(self.FRAME_MS, self._step)
+        else:
+            self.running = False
+            self._job = None
 
 
-def _fast_wheel(self, event):
-    """CustomTkinter scrolls ~20px per wheel notch, which feels stuck. Move a comfortable ~3 lines instead."""
-    if not self._check_if_valid_scroll(event.widget):
+SCROLLER: Scroller | None = None
+
+
+def _smooth_wheel(self, event):
+    """CustomTkinter scrolls ~20px per notch, which feels stuck; this moves about three lines, smoothly."""
+    if SCROLLER is None or not self._check_if_valid_scroll(event.widget):
         return
-    canvas = self._parent_canvas
-    if canvas.yview() == (0.0, 1.0):
-        return
-    step = -event.delta / 120 * WHEEL["px"]
-    canvas.yview("scroll", int(step) if abs(step) >= 1 else (-1 if event.delta > 0 else 1), "units")
+    SCROLLER.add(self._parent_canvas, -event.delta / 120 * WHEEL["px"])
 
 
-ctk.CTkScrollableFrame._mouse_wheel_all = _fast_wheel
+ctk.CTkScrollableFrame._mouse_wheel_all = _smooth_wheel
+
+
+class ScrollFrame(ctk.CTkScrollableFrame):
+    """A scrolling panel with pixel-exact scrolling and a slim scrollbar."""
+
+    def __init__(self, master, **kw):
+        kw.setdefault("fg_color", "transparent")
+        kw.setdefault("scrollbar_button_color", C["card2"])
+        kw.setdefault("scrollbar_button_hover_color", C["border"])
+        super().__init__(master, **kw)
+        self._parent_canvas.configure(yscrollincrement=1)
+        try:
+            self._scrollbar.configure(width=10)
+        except (tk.TclError, ValueError):
+            pass
+
+
+def scroll_frame(parent, **kw):
+    return ScrollFrame(parent, **kw)
 
 
 def load_prefs() -> dict:
@@ -113,6 +191,11 @@ def friendly_error(e: BaseException) -> str:
     if "getaddrinfo" in low or "connection aborted" in low or "timed out" in low:
         return "Can't reach Google. Check your internet connection."
     return text if len(text) < 300 else text[:297] + "..."
+
+
+def hidden_mode() -> bool:
+    """Automated tests set this so their windows are invisible instead of flashing on screen."""
+    return bool(os.environ.get("SCHEDULE_MANAGER_HIDDEN"))
 
 
 MUTEX_NAME = "ScheduleManager.v2.SingleInstance"
@@ -157,28 +240,53 @@ def label(parent, text="", size=13, weight="normal", color=None, **kw):
 
 def card(parent, **kw):
     kw.setdefault("fg_color", C["card"])
-    kw.setdefault("corner_radius", 14)
+    kw.setdefault("corner_radius", 16)
+    kw.setdefault("border_width", 1)
+    kw.setdefault("border_color", C["border"])
     return ctk.CTkFrame(parent, **kw)
 
 
 def button(parent, text, command, kind="normal", width=None, **kw):
-    styles = {
-        "primary": (C["accent"], C["accent_hover"], "#ffffff"),
-        "normal": (C["card2"], C["border"], C["text"]),
-        "danger": (C["danger_bg"], C["danger"], "#ffffff"),
-        "ghost": ("transparent", C["card2"], C["muted"]),
+    styles = {  # fill, hover, text, border
+        "primary": (C["accent"], C["accent_hover"], "#ffffff", 0),
+        "normal": (C["card2"], C["border"], C["text"], 0),
+        "danger": (C["danger_bg"], C["danger"], "#ffffff", 0),
+        "ghost": ("transparent", C["card2"], C["muted"], 0),
     }
-    fg, hover, tc = styles[kind]
+    fg, hover, tc, border = styles[kind]
     if width:
         kw["width"] = width
     return ctk.CTkButton(parent, text=text, command=command, fg_color=fg, hover_color=hover, text_color=tc,
-                         text_color_disabled=C["muted"], corner_radius=10, height=34, font=font(13, "bold"), **kw)
+                         text_color_disabled=C["dim"], corner_radius=10, height=36, border_width=border,
+                         font=font(13, "bold"), **kw)
 
 
 def entry(parent, width=200, placeholder="", textvariable=None):
-    return ctk.CTkEntry(parent, width=width, height=34, fg_color=C["card2"], border_color=C["border"],
+    return ctk.CTkEntry(parent, width=width, height=36, fg_color=C["card2"], border_color=C["border"],
                         text_color=C["text"], placeholder_text=placeholder, textvariable=textvariable,
-                        corner_radius=8, font=font(13))
+                        corner_radius=10, font=font(13))
+
+
+def segmented(parent, values=(), command=None, width=None, size=12, **_ignored):
+    box = ctk.CTkSegmentedButton(parent, values=values, command=command, selected_color=C["accent"],
+                                 selected_hover_color=C["accent_hover"], unselected_color=C["card2"],
+                                 unselected_hover_color=C["border"], fg_color=C["card2"], text_color=C["text"],
+                                 corner_radius=10, font=font(size, "bold"), height=34)
+    if width:
+        box.configure(width=width)
+    return box
+
+
+def option_menu(parent, values=(), command=None, width=140, **_ignored):
+    return ctk.CTkOptionMenu(parent, values=values, command=command, width=width, height=36, fg_color=C["card2"],
+                             button_color=C["card2"], button_hover_color=C["border"], dropdown_fg_color=C["card"],
+                             dropdown_hover_color=C["card2"], dropdown_text_color=C["text"], text_color=C["text"],
+                             corner_radius=10, font=font(13, "bold"), dropdown_font=font(13))
+
+
+def switch(parent, text="", command=None, size=13, **_ignored):
+    return ctk.CTkSwitch(parent, text=text, command=command, progress_color=C["accent"], button_color="#ffffff",
+                         button_hover_color="#dfe6ff", fg_color=C["border"], font=font(size), text_color=C["text"])
 
 
 def textbox(parent, mono=True, size=13, **kw):
@@ -202,13 +310,13 @@ def set_text(box, text: str, line_colors=None):
 
 def make_tree(parent, columns, height=10, selectmode="browse"):
     """columns: list of (id, heading, width, anchor). Returns (frame, tree)."""
-    frame = ctk.CTkFrame(parent, fg_color=C["card"], corner_radius=12)
+    frame = ctk.CTkFrame(parent, fg_color=C["card"], corner_radius=16, border_width=1, border_color=C["border"])
     tree = ttk.Treeview(frame, columns=[c[0] for c in columns], show="headings", style="App.Treeview",
                         height=height, selectmode=selectmode)
     for cid, head, width, anchor in columns:
         tree.heading(cid, text=head, anchor="w")
         tree.column(cid, width=width, anchor=anchor, stretch=True)
-    sb = ctk.CTkScrollbar(frame, command=tree.yview)
+    sb = ctk.CTkScrollbar(frame, command=tree.yview, width=10, button_color=C["card2"], button_hover_color=C["border"])
     tree.configure(yscrollcommand=sb.set)
     sb.pack(side="right", fill="y", padx=(0, 4), pady=8)
     tree.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
@@ -293,6 +401,8 @@ def event_row(parent, ev, with_day=False, muted=False):
 class Modal(ctk.CTkToplevel):
     def __init__(self, app, title, width=460):
         super().__init__(app, fg_color=C["card"])
+        if hidden_mode():
+            self.attributes("-alpha", 0.0)
         self.app = app
         self.result = None
         self._dlg_w = width
@@ -345,10 +455,26 @@ class Modal(ctk.CTkToplevel):
         self.destroy()
 
 
+class LazyPages(dict):
+    """app.pages[key] builds a page the first time it is asked for; .get(key) only returns pages that already exist."""
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+
+    def __missing__(self, key):
+        if key not in self.app.PAGES:
+            raise KeyError(key)
+        page = globals()[self.app.PAGES[key]](self.app.content, self.app)
+        self[key] = page
+        return page
+
+
 class App(ctk.CTk):
-    NAV = [("dashboard", "Dashboard"), ("week", "Week"), ("month", "Month"), ("plan", "Study planner"), ("earnings", "Earnings"), ("import", "Import"),
-           ("manage", "Manage weeks"), ("report", "Report"), ("history", "History"), ("settings", "Settings"),
+    NAV = [("dashboard", "Dashboard"), ("week", "Week"), ("month", "Month"), ("plan", "Study planner"), ("earnings", "Earnings"),
+           ("import", "Import"), ("manage", "Manage weeks"), ("report", "Report"), ("settings", "Settings"),
            ("help", "About & help")]
+    NAV_SECTIONS = {"dashboard": "", "import": "SCHEDULE", "settings": "APP"}  # a small heading above these items
 
     def __init__(self):
         try:
@@ -358,12 +484,17 @@ class App(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("dark-blue")
         super().__init__(fg_color=C["bg"])
+        icon_image.cache_clear()  # images belong to one Tk root; a fresh window needs fresh ones
+        if hidden_mode():
+            self.attributes("-alpha", 0.0)
         self.title(f"Schedule Manager v{core.APP_VERSION}")
         self.prefs = load_prefs()
-        apply_accent(self.prefs.get("accent", "Indigo"))
         self.configure(fg_color=C["bg"])
-        self.geometry(self._initial_size())
-        self.minsize(980, 580)
+        self.minsize(980, 620)
+        if hidden_mode():
+            self.geometry("1440x880+-20000+0")  # tests: a fixed size, off screen
+        else:
+            self._open_maximized()
         if ICON_ICO.exists():
             try:
                 self.iconbitmap(str(ICON_ICO))
@@ -375,7 +506,9 @@ class App(ctk.CTk):
             self.scale = max(1.0, float(ctk.ScalingTracker.get_window_scaling(self)))
         except Exception:
             self.scale = 1.0
-        WHEEL["px"] = 75 * self.scale
+        WHEEL["px"] = 96 * self.scale
+        global SCROLLER
+        SCROLLER = Scroller(self)
 
         # Tk objects must only be freed on the main thread: run the cyclic GC from _poll instead of
         # letting it fire inside background workers.
@@ -396,10 +529,14 @@ class App(ctk.CTk):
         self.update_check = None
         self.update_text = ""
         self._update_running = False
+        self.config_stamp = 0
         self._load_config()
         self._build_ui()
         self.show_page("dashboard")
+        self.after(1500, self._prebuild_pages)
         self.bind("<F5>", lambda _e: self.pages[self.current].refresh())
+        self.bind("<F11>", lambda _e: self.attributes("-fullscreen", not self.attributes("-fullscreen")))
+        self.bind("<Escape>", lambda _e: self.attributes("-fullscreen", False), add="+")
         self.bind("<Control-n>", lambda _e: self.quick_add())
         for combo in ("<Control-f>", "<Control-F>"):
             self.bind(combo, lambda _e: self.search())
@@ -419,103 +556,82 @@ class App(ctk.CTk):
 
     SYNC_EVERY_MS = 6 * 60 * 1000
 
+    def _open_maximized(self):
+        """The window opens filling the screen (F11 goes fully fullscreen)."""
+        self.wm_state("zoomed")
+
     PAGES = {"dashboard": "DashboardPage", "week": "WeekPage", "month": "MonthPage", "plan": "PlanPage",
              "earnings": "EarningsPage", "import": "ImportPage", "manage": "ManagePage", "report": "ReportPage",
-             "history": "HistoryPage", "settings": "SettingsPage", "help": "HelpPage"}
+             "settings": "SettingsPage", "help": "HelpPage"}
 
     def _build_ui(self):
-        """The sidebar and every page. Called at startup and again when the accent color changes."""
         self._style_ttk()
-        self.pages, self.nav_buttons, self.current = {}, {}, None
+        self.pages, self.nav_buttons, self.current = LazyPages(self), {}, None
         self._build_sidebar()
         self.content = ctk.CTkFrame(self, fg_color="transparent")
-        self.content.pack(side="left", fill="both", expand=True, padx=(0, 22), pady=18)
-        for key, cls_name in self.PAGES.items():
-            self.pages[key] = globals()[cls_name](self.content, self)
+        self.content.pack(side="left", fill="both", expand=True, padx=(4, 30), pady=(26, 20))
+        self.pages["dashboard"]
 
-    def set_accent(self, name: str):
-        if name not in ACCENTS or name == self.prefs.get("accent", "Indigo"):
-            return
-        if self.write_lock.locked():
-            self.toast("Wait for the current task to finish, then try again.", "warn")
-            return
-        apply_accent(name)
-        self.prefs["accent"] = name
-        save_prefs(self.prefs)
-        self.request_sync()
-        keep, account = self.current or "dashboard", self.account_lbl.cget("text")
-        self.sidebar.destroy()
-        self.content.destroy()
-        self._build_ui()
-        self.account_lbl.configure(text=account)
-        self.show_page(keep)
-
-    def _initial_size(self) -> str:
-        """Saved size, clamped so the window always fits the screen (taskbar included)."""
-        max_w = self.winfo_screenwidth() - 40
-        max_h = self.winfo_screenheight() - 110
-        try:
-            w, h = (int(v) for v in str(self.prefs.get("size", "1240x760")).split("x"))
-        except ValueError:
-            w, h = 1240, 760
-        w, h = min(w, max_w), min(h, max_h)
-        x = max((self.winfo_screenwidth() - w) // 2, 0)
-        y = max((self.winfo_screenheight() - h) // 2 - 30, 0)
-        return f"{w}x{h}+{x}+{y}"
+    def _prebuild_pages(self):
+        """Build the pages that haven't been opened yet, one at a time while the app is idle, so the first visit is instant."""
+        for key in self.PAGES:
+            if key not in self.pages:
+                self.pages[key]
+                self.after(120, self._prebuild_pages)
+                return
 
     def _style_ttk(self):
         s = ttk.Style(self)
         s.theme_use("clam")
-        rh = int(30 * self.scale)
+        rh = int(34 * self.scale)
         s.configure("App.Treeview", background=C["card"], fieldbackground=C["card"], foreground=C["text"],
                     borderwidth=0, rowheight=rh, font=("Segoe UI", round(10 * self.scale)),
                     bordercolor=C["card"], lightcolor=C["card"], darkcolor=C["card"])
         s.map("App.Treeview", background=[("selected", C["select"])], foreground=[("selected", "#ffffff")])
-        s.configure("App.Treeview.Heading", background=C["card2"], foreground=C["muted"], relief="flat",
-                    font=("Segoe UI", round(9 * self.scale), "bold"), padding=(6, 6))
-        s.map("App.Treeview.Heading", background=[("active", C["border"])])
+        s.configure("App.Treeview.Heading", background=C["card"], foreground=C["muted"], relief="flat",
+                    font=("Segoe UI", round(9 * self.scale), "bold"), padding=(8, 8), borderwidth=0)
+        s.map("App.Treeview.Heading", background=[("active", C["card2"])])
 
     def _build_sidebar(self):
-        side = self.sidebar = ctk.CTkFrame(self, width=222, fg_color=C["sidebar"], corner_radius=0)
-        side.pack(side="left", fill="y")
+        side = ctk.CTkFrame(self, width=240, fg_color=C["sidebar"], corner_radius=0)
+        side.pack(side="left", fill="y", padx=(0, 26))
         side.pack_propagate(False)
 
         brand = ctk.CTkFrame(side, fg_color="transparent")
-        brand.pack(fill="x", padx=18, pady=(22, 20))
+        brand.pack(fill="x", padx=22, pady=(28, 22))
         if ICON_PNG.exists():
-            img = ctk.CTkImage(Image.open(ICON_PNG), size=(36, 36))
+            img = ctk.CTkImage(Image.open(ICON_PNG), size=(38, 38))
             ctk.CTkLabel(brand, image=img, text="").pack(side="left")
         names = ctk.CTkFrame(brand, fg_color="transparent")
-        names.pack(side="left", padx=10)
-        label(names, "Schedule", 16, "bold").pack(anchor="w")
-        label(names, f"Manager  v{core.APP_VERSION}", 12, color=C["muted"]).pack(anchor="w")
+        names.pack(side="left", padx=12)
+        label(names, "Schedule", 17, "bold").pack(anchor="w")
+        label(names, "Manager", 12, color=C["muted"]).pack(anchor="w")
 
-        self.nav_bars = {}
-        for i, (key, text) in enumerate(self.NAV, start=1):
-            wrap = ctk.CTkFrame(side, fg_color="transparent")
-            wrap.pack(fill="x", padx=(6, 12), pady=2)
-            bar = ctk.CTkFrame(wrap, width=4, height=22, corner_radius=2, fg_color="transparent")
-            bar.pack(side="left", padx=(0, 4))
-            b = ctk.CTkButton(wrap, text=f"  {text}", anchor="w", height=40, corner_radius=10,
+        for key, text in self.NAV:
+            heading = self.NAV_SECTIONS.get(key)
+            if heading:
+                label(side, heading, 10, "bold", C["dim"]).pack(anchor="w", padx=28, pady=(16, 4))
+            b = ctk.CTkButton(side, text=f"   {text}", anchor="w", height=42, corner_radius=12, border_spacing=10,
                               fg_color="transparent", hover_color=C["card2"], text_color=C["muted"],
+                              image=icon_image(NAV_ICONS[key], C["muted"]), compound="left",
                               font=font(14, "bold"), command=lambda k=key: self.show_page(k))
-            b.pack(side="left", fill="x", expand=True)
+            b.pack(fill="x", padx=14, pady=1)
             self.nav_buttons[key] = b
-            self.nav_bars[key] = bar
 
         foot = ctk.CTkFrame(side, fg_color="transparent")
-        foot.pack(side="bottom", fill="x", padx=18, pady=18)
-        self.offline_lbl = label(foot, "", 12, "bold", C["warning"], anchor="w", wraplength=180, justify="left")
-        self.account_lbl = label(foot, "Not connected yet", 12, color=C["muted"], anchor="w", wraplength=180)
+        foot.pack(side="bottom", fill="x", padx=22, pady=20)
+        self.offline_lbl = label(foot, "", 12, "bold", C["warning"], anchor="w", wraplength=190, justify="left")
+        self.account_lbl = label(foot, "Not connected yet", 12, color=C["muted"], anchor="w", wraplength=190)
         self.account_lbl.pack(anchor="w", pady=(0, 6))
         row = ctk.CTkFrame(foot, fg_color="transparent")
         row.pack(fill="x")
-        self.dot = label(row, "●", 12, color=C["success"])
+        self.dot = label(row, "\u25cf", 12, color=C["success"])
         self.dot.pack(side="left")
-        self.status_lbl = label(row, "Ready", 12, color=C["muted"], anchor="w", wraplength=160, justify="left")
+        self.status_lbl = label(row, "Ready", 12, color=C["muted"], anchor="w", wraplength=170, justify="left")
         self.status_lbl.pack(side="left", padx=6)
 
     def _load_config(self):
+        self.config_stamp += 1
         if not core.CONFIG_PATH.exists() and core.CONFIG_EXAMPLE_PATH.exists():
             import shutil
             shutil.copy(core.CONFIG_EXAMPLE_PATH, core.CONFIG_PATH)
@@ -640,12 +756,7 @@ class App(ctk.CTk):
             self.reload_store()
         if "prefs" in pulled:
             fresh = load_prefs()
-            old = self.prefs.get("accent", "Indigo")
             self.prefs.update({k: fresh[k] for k in sync.SYNCED_PREFS if k in fresh})
-            new = self.prefs.get("accent", "Indigo")
-            if new != old and new in ACCENTS:
-                self.prefs["accent"] = old
-                self.set_accent(new)
         self.invalidate()
         page = self.pages.get(self.current)
         if page is not None and self.current != "settings":
@@ -756,9 +867,9 @@ class App(ctk.CTk):
         work_dir = core.BASE_DIR / "update"
 
         def work():
-            package = updater.download(self._update_service(), update)
-            shutil.rmtree(work_dir, ignore_errors=True)
             key = updater.load_public_key(core.RESOURCE_DIR / updater.KEY_NAME)
+            package = updater.download(self._update_service(), update, public_key=key)
+            shutil.rmtree(work_dir, ignore_errors=True)
             return updater.stage(package, update, info, key, install_dir, work_dir / "stage")
 
         def done(staged):
@@ -819,12 +930,12 @@ class App(ctk.CTk):
     def show_page(self, key):
         if self.current:
             self.pages[self.current].pack_forget()
-            self.nav_buttons[self.current].configure(fg_color="transparent", text_color=C["muted"])
-            self.nav_bars[self.current].configure(fg_color="transparent")
+            old = self.nav_buttons[self.current]
+            old.configure(fg_color="transparent", text_color=C["muted"], image=icon_image(NAV_ICONS[self.current], C["muted"]))
         self.current = key
         self.pages[key].pack(fill="both", expand=True)
-        self.nav_buttons[key].configure(fg_color=C["card2"], text_color=C["text"])
-        self.nav_bars[key].configure(fg_color=C["accent"])
+        self.nav_buttons[key].configure(fg_color=C["accent_soft"], text_color=C["text"],
+                                        image=icon_image(NAV_ICONS[key], C["accent_hover"]))
         self.pages[key].on_show()
 
     def set_status(self, text, level="ok"):
@@ -847,7 +958,7 @@ class App(ctk.CTk):
                 self._toast.destroy()
             except tk.TclError:
                 pass
-        t = ctk.CTkFrame(self, fg_color=C["card2"], corner_radius=12, border_width=1, border_color=color)
+        t = ctk.CTkFrame(self, fg_color=C["card2"], corner_radius=14, border_width=1, border_color=color)
         label(t, text, 13, wraplength=380, justify="left").pack(side="left", padx=16, pady=12)
         if action:
             def run_action():
@@ -880,13 +991,6 @@ class App(ctk.CTk):
         button(row, "Cancel", lambda: m.close(False), "normal", width=100).pack(side="right", padx=8)
         m.show()
         return bool(m.result)
-
-    def alert(self, title, message):
-        m = Modal(self, title)
-        label(m.body, title, 18, "bold").pack(anchor="w")
-        label(m.body, message, 13, color=C["muted"], wraplength=410, justify="left").pack(anchor="w", pady=(8, 14))
-        button(m.body, "OK", lambda: m.close(True), "primary", width=100).pack(anchor="e")
-        m.show()
 
     def run_async(self, work, on_success, on_error=None, exclusive=False):
         def worker():
@@ -978,9 +1082,8 @@ class App(ctk.CTk):
             _dx, dy = (int(v) for v in self.tk.splitlist(self.tk.call("tk::PreciseScrollDeltas", event.delta)))
         except (tk.TclError, ValueError, TypeError):
             return
-        if dy and canvas.yview() != (0.0, 1.0):
-            px = int(-dy * 1.33 * self.scale)
-            canvas.yview_scroll(px or (-1 if dy > 0 else 1), "units")  # 1 unit = 1px
+        if dy:
+            SCROLLER.add(canvas, -dy * 1.33 * self.scale)
 
     def report_callback_exception(self, exc, val, tb):
         log_error("".join(traceback.format_exception(exc, val, tb)))
@@ -1032,8 +1135,6 @@ class App(ctk.CTk):
         self.after(8000, self.maybe_check_updates)
 
     def _on_close(self):
-        self.prefs["size"] = self.geometry().split("+")[0]
-        save_prefs(self.prefs)
         self.destroy()
 
 
@@ -1077,7 +1178,7 @@ class QuickAddDialog:
         note = label(m.body, "", 12, color=C["warning"], wraplength=450, justify="left", anchor="w")
         note.pack(anchor="w", pady=(10, 0))
         reminders = core.reminder_list(app.config_data)
-        remind = ctk.CTkSwitch(m.body, text=f"Remind me {core.describe_reminders(reminders)} before",
+        remind = switch(m.body, text=f"Remind me {core.describe_reminders(reminders)} before",
                                progress_color=C["accent"], font=font(13))
         remind.select()
         remind.pack(anchor="w", pady=(10, 14))
@@ -1397,10 +1498,10 @@ class Page(ctk.CTkFrame):
 
     def build_header(self, title, subtitle=""):
         head = ctk.CTkFrame(self, fg_color="transparent")
-        head.pack(fill="x", pady=(0, 16))
+        head.pack(fill="x", pady=(0, 20))
         left = ctk.CTkFrame(head, fg_color="transparent")
         left.pack(side="left")
-        self.title_lbl = label(left, title, 26, "bold")
+        self.title_lbl = label(left, title, 28, "bold")
         self.title_lbl.pack(anchor="w")
         self.sub_lbl = label(left, subtitle, 13, color=C["muted"])
         self.sub_lbl.pack(anchor="w")
@@ -1423,10 +1524,10 @@ class Page(ctk.CTkFrame):
 
 def stat_card(parent, title):
     c = card(parent)
-    c.title_lbl = label(c, title.upper(), 11, "bold", C["muted"])
-    c.title_lbl.pack(anchor="w", padx=16, pady=(14, 0))
-    value = label(c, "-", 21, "bold")
-    value.pack(anchor="w", padx=16, pady=(2, 14))
+    c.title_lbl = label(c, title.upper(), 10, "bold", C["dim"])
+    c.title_lbl.pack(anchor="w", padx=18, pady=(16, 0))
+    value = label(c, "-", 24, "bold")
+    value.pack(anchor="w", padx=18, pady=(2, 16))
     return c, value
 
 
@@ -1447,24 +1548,32 @@ class DashboardPage(Page):
         body.grid_columnconfigure((0, 1, 2), weight=1, uniform="d")
         body.grid_rowconfigure(2, weight=1)
 
-        hero = card(body, border_width=1, border_color=C["border"])
-        hero.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=(0, 8), pady=(0, 8))
-        label(hero, "NEXT UP", 11, "bold", C["accent"]).pack(anchor="w", padx=22, pady=(18, 0))
-        self.hero_title = label(hero, "Loading...", 30, "bold")
-        self.hero_title.pack(anchor="w", padx=22, pady=(4, 0))
-        self.hero_time = label(hero, "", 15, color=C["muted"])
-        self.hero_time.pack(anchor="w", padx=22)
-        self.hero_count = label(hero, "", 15, "bold", C["accent"])
-        self.hero_count.pack(anchor="w", padx=22, pady=(6, 0))
-        self.hero_then = label(hero, "", 12, color=C["muted"], justify="left", anchor="w")
-        self.hero_then.pack(anchor="w", padx=22, pady=(10, 18))
+        hero = card(body)
+        hero.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=(0, 10), pady=(0, 10))
+        hero.grid_columnconfigure(0, weight=3, uniform="h")
+        hero.grid_columnconfigure(1, weight=2, uniform="h")
+        hero.grid_rowconfigure(0, weight=1)
+        left = ctk.CTkFrame(hero, fg_color="transparent")
+        left.grid(row=0, column=0, sticky="nsew", padx=(26, 10), pady=22)
+        label(left, "NEXT UP", 11, "bold", C["accent_hover"]).pack(anchor="w")
+        self.hero_title = label(left, "Loading...", 34, "bold")
+        self.hero_title.pack(anchor="w", pady=(6, 0))
+        self.hero_time = label(left, "", 15, color=C["muted"])
+        self.hero_time.pack(anchor="w", pady=(2, 0))
+        self.hero_count = label(left, "", 16, "bold", C["accent"])
+        self.hero_count.pack(anchor="w", pady=(14, 0))
+        right = ctk.CTkFrame(hero, fg_color=C["card2"], corner_radius=12)
+        right.grid(row=0, column=1, sticky="nsew", padx=(0, 18), pady=18)
+        label(right, "AFTER THAT", 10, "bold", C["dim"]).pack(anchor="w", padx=18, pady=(16, 6))
+        self.hero_then = label(right, "", 13, color=C["muted"], justify="left", anchor="w")
+        self.hero_then.pack(anchor="w", padx=18, pady=(0, 16))
 
         stats = ctk.CTkFrame(body, fg_color="transparent")
-        stats.grid(row=0, column=2, sticky="nsew", padx=(8, 0), pady=(0, 8))
+        stats.grid(row=0, column=2, sticky="nsew", padx=(10, 0), pady=(0, 10))
         stats.grid_columnconfigure((0, 1), weight=1, uniform="s")
         self.range = "This week"
         self.data = None
-        self.seg = ctk.CTkSegmentedButton(stats, values=["This week", "Next week"], command=self._set_range,
+        self.seg = segmented(stats, values=["This week", "Next week"], command=self._set_range,
                                           selected_color=C["accent"], selected_hover_color=C["accent_hover"],
                                           unselected_color=C["card2"], fg_color=C["card2"], font=font(12, "bold"))
         self.seg.set("This week")
@@ -1486,13 +1595,12 @@ class DashboardPage(Page):
         c.grid(row=2, column=1, sticky="nsew", padx=4, pady=4)
 
         self.timeline = DayTimeline(body, dict(C), cat_color, app.scale)
-        self.timeline.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        self.timeline.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 10))
 
         self.today_box = self._panel(body, "Today", 0)
         self.heads_box = self._panel(body, "Heads up (next 2 weeks)", 1)
         self.upcoming_box = self._panel(body, "Coming up", 2)
 
-        self.next_event = None
         self.future = None
         self.last_refresh = 0.0
         self.last_email_check = 0.0
@@ -1502,9 +1610,9 @@ class DashboardPage(Page):
 
     def _panel(self, parent, title, col):
         c = card(parent)
-        c.grid(row=2, column=col, sticky="nsew", padx=(0 if col == 0 else 8, 0 if col == 2 else 8), pady=(0, 0))
-        label(c, title, 14, "bold").pack(anchor="w", padx=16, pady=(14, 6))
-        box = ctk.CTkScrollableFrame(c, fg_color="transparent")
+        c.grid(row=2, column=col, sticky="nsew", padx=(0 if col == 0 else 10, 0 if col == 2 else 10), pady=(0, 0))
+        label(c, title, 15, "bold").pack(anchor="w", padx=20, pady=(18, 6))
+        box = scroll_frame(c, fg_color="transparent")
         box.pack(fill="both", expand=True, padx=6, pady=(0, 8))
         return box
 
@@ -1676,7 +1784,7 @@ class DashboardPage(Page):
             return
         now = datetime.now()
         upcoming = [e for e in self.future if e["end"] >= now]
-        self.next_event = ev = upcoming[0] if upcoming else None
+        ev = upcoming[0] if upcoming else None
         if ev:
             self.hero_title.configure(text=ev["summary"])
             self.hero_time.configure(text=f"{core.DAY_ABBR[ev['day'].weekday()]} {core.fmt_date_short(ev['day'])}"
@@ -1687,8 +1795,8 @@ class DashboardPage(Page):
                 self.hero_count.configure(text=humanize_delta(ev["start"] - now).replace("in ", "Starts in "),
                                           text_color=C["accent"])
             self.hero_then.configure(text="\n".join(
-                f"then  {e['summary']}  ·  {core.DAY_ABBR[e['day'].weekday()]} {core.fmt_time(e['start'])}"
-                for e in upcoming[1:5]))
+                f"{e['summary']}   {core.DAY_ABBR[e['day'].weekday()]} {core.fmt_time(e['start'])}"
+                for e in upcoming[1:5]) or "Nothing else scheduled")
         else:
             self.hero_title.configure(text="Nothing coming up")
             self.hero_time.configure(text="")
@@ -1749,11 +1857,7 @@ class WeekPage(Page):
         self.btn_next = button(actions, ">", lambda: self.shift(1), "normal", width=40)
         self.btn_next.pack(side="left", padx=(2, 12))
         button(actions, "Find", app.search, "normal", width=70).pack(side="left", padx=4)
-        self.export_menu = ctk.CTkOptionMenu(
-            actions, values=["CSV file", "Calendar file (.ics)"], command=self._export_choice, width=100, height=34,
-            fg_color=C["card2"], button_color=C["card2"], button_hover_color=C["border"], dropdown_fg_color=C["card"],
-            dropdown_hover_color=C["card2"], dropdown_text_color=C["text"], text_color=C["text"], corner_radius=10,
-            font=font(13, "bold"), dropdown_font=font(13))
+        self.export_menu = option_menu(actions, ["CSV file", "Calendar file (.ics)"], self._export_choice, width=110)
         self.export_menu.set("Export")
         self.export_menu.pack(side="left", padx=4)
         button(actions, "+ Add event", lambda: app.quick_add(self.week_start), "primary", width=120).pack(
@@ -1763,9 +1867,10 @@ class WeekPage(Page):
         body.pack(fill="both", expand=True)
         self.grid_view = WeekGrid(body, dict(C), cat_color, self.on_select, app.scale,
                                   on_move=self.on_move, on_create=self.on_create)
+        self.grid_view.scroller = SCROLLER
         self.grid_view.pack(side="left", fill="both", expand=True, padx=(0, 12))
 
-        side = ctk.CTkScrollableFrame(body, width=290, fg_color="transparent")
+        side = scroll_frame(body, width=290, fg_color="transparent")
         side.pack(side="right", fill="y")
         self.detail = card(side)
         self.detail.pack(fill="x", pady=(0, 10))
@@ -2082,7 +2187,7 @@ class PlanPage(Page):
         super().__init__(master, app)
         self.plan = []
         actions = self.build_header("Study planner", "Finds free time in your week and suggests study blocks")
-        self.seg = ctk.CTkSegmentedButton(actions, values=["This week", "Next week"], command=lambda _v: self.suggest(),
+        self.seg = segmented(actions, values=["This week", "Next week"], command=lambda _v: self.suggest(),
                                           selected_color=C["accent"], selected_hover_color=C["accent_hover"],
                                           unselected_color=C["card2"], fg_color=C["card2"], font=font(13, "bold"))
         self.seg.set("Next week" if date.today().weekday() >= 5 else "This week")  # little of this week is left on weekends
@@ -2103,9 +2208,7 @@ class PlanPage(Page):
         self.goal.insert(0, f"{prefs.get('plan_goal', 8):g}")
         self.goal.pack(anchor="w", padx=18, pady=(2, 10))
         label(left, "Longest block", 12, color=C["muted"]).pack(anchor="w", padx=18)
-        self.longest = ctk.CTkOptionMenu(left, values=["1 hour", "2 hours", "3 hours"], width=140, height=34,
-                                         fg_color=C["card2"], button_color=C["card2"], button_hover_color=C["border"],
-                                         dropdown_fg_color=C["card"], text_color=C["text"], font=font(13))
+        self.longest = option_menu(left, ["1 hour", "2 hours", "3 hours"], width=150)
         self.longest.set(prefs.get("plan_longest", "2 hours"))
         self.longest.pack(anchor="w", padx=18, pady=(2, 10))
         label(left, "Calendar title", 12, color=C["muted"]).pack(anchor="w", padx=18)
@@ -2208,7 +2311,7 @@ class EarningsPage(Page):
         self.rows = []
         self.mode = ("weeks", 8)
         actions = self.build_header("Earnings", "Estimated pay from your calendar, by week")
-        self.seg = ctk.CTkSegmentedButton(actions, values=["4 weeks", "8 weeks", "12 weeks", "6 months", "Pay periods"],
+        self.seg = segmented(actions, values=["4 weeks", "8 weeks", "12 weeks", "6 months", "Pay periods"],
                                           command=self._pick,
                                           selected_color=C["accent"], selected_hover_color=C["accent_hover"],
                                           unselected_color=C["card2"], fg_color=C["card2"], font=font(13, "bold"))
@@ -2381,12 +2484,12 @@ class ImportPage(Page):
         self.preview.configure(state="disabled")
         opts = ctk.CTkFrame(right, fg_color="transparent")
         opts.pack(fill="x", padx=16, pady=(10, 0))
-        self.remove_stale = ctk.CTkSwitch(opts, text="Remove dropped shifts", progress_color=C["accent"], font=font(12))
+        self.remove_stale = switch(opts, text="Remove dropped shifts", progress_color=C["accent"], font=font(12))
         self.remove_stale.select()
         self.remove_stale.grid(row=0, column=0, sticky="w", padx=(0, 14), pady=2)
-        self.no_email = ctk.CTkSwitch(opts, text="Skip email", progress_color=C["accent"], font=font(12))
+        self.no_email = switch(opts, text="Skip email", progress_color=C["accent"], font=font(12))
         self.no_email.grid(row=0, column=1, sticky="w", padx=(0, 14), pady=2)
-        self.force = ctk.CTkSwitch(opts, text="Force re-add", progress_color=C["accent"], font=font(12))
+        self.force = switch(opts, text="Force re-add", progress_color=C["accent"], font=font(12))
         self.force.grid(row=1, column=0, sticky="w", pady=2)
         row = ctk.CTkFrame(right, fg_color="transparent")
         row.pack(fill="x", padx=16, pady=14)
@@ -2809,61 +2912,56 @@ class ReportPage(Page):
             self.app.toast(f"Saved {os.path.basename(path)}", "success")
 
 
-class HistoryPage(Page):
-    def __init__(self, master, app):
-        super().__init__(master, app)
-        actions = self.build_header("History", "Every import, delete, undo, and quick-add")
-        button(actions, "Refresh", self.refresh, "normal", width=90).pack(side="left")
-        frame, self.tree = make_tree(self, [("ts", "When", 170, "w"), ("action", "Action", 110, "w"),
-                                            ("week", "Week", 110, "w"), ("detail", "Details", 300, "w")], height=18)
-        frame.pack(fill="both", expand=True)
-        self.tree_frame = frame
-        make_sortable(self.tree)
-
-    def on_show(self):
-        self.refresh()
-
-    def refresh(self):
-        self.app.reload_store()
-        self.tree.delete(*self.tree.get_children())
-        show_empty(self.tree_frame, None if self.app.store.data["history"] else "No history yet.")
-        for e in reversed(self.app.store.data["history"]):
-            n = len(e.get("event_ids", []))
-            detail = e.get("title") or (f"{n} event(s)" if n else "")
-            if e.get("undone"):
-                detail += "  (undone)"
-            self.tree.insert("", "end", values=(fmt_stamp(e["timestamp"]), e["action"].replace("_", " "), e.get("week", ""), detail))
-
-
 class SettingsPage(Page):
     def __init__(self, master, app):
         super().__init__(master, app)
         actions = self.build_header("Settings", "Saved to config.json in this folder")
         button(actions, "Save changes", self.save, "primary", width=130).pack(side="left")
 
-        self.scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        self.tab_bar = segmented(self, self.TABS, self._show_tab, size=13)
+        self.tab_bar.pack(anchor="w", pady=(0, 16))
+        self.scroll = scroll_frame(self, fg_color="transparent")
         self.scroll.pack(fill="both", expand=True)
+        self.tab_frames = {name: ctk.CTkFrame(self.scroll, fg_color="transparent") for name in self.TABS}
+        self.tab_bar.set(self.TABS[0])
+        self.tab_frames[self.TABS[0]].pack(fill="x")
         self.vars = {}
         self.job_rows = []
-        self._build()
+        self._stamp = None
+
+    TABS = ["General", "Jobs & pay", "Alerts", "Data"]
+
+    def _show_tab(self, name):
+        for frame in self.tab_frames.values():
+            frame.pack_forget()
+        self.tab_frames[name].pack(fill="x")
+        self.scroll._parent_canvas.yview_moveto(0)
 
     def on_show(self):
-        for w in self.scroll.winfo_children():
-            w.destroy()
-        self.vars, self.job_rows = {}, []
-        self._build()
+        """The form is built once, and again only after the settings have changed underneath it."""
+        if self._stamp != self.app.config_stamp:
+            self._rebuild()
 
     def refresh(self):
-        self.on_show()
+        self._rebuild()
+
+    def _rebuild(self):
+        for frame in self.tab_frames.values():
+            for w in frame.winfo_children():
+                w.destroy()
+        self.vars, self.job_rows = {}, []
+        self._stamp = self.app.config_stamp
+        self._build()
 
     def _section(self, title, hint=""):
-        c = card(self.scroll)
-        c.pack(fill="x", pady=(0, 12), padx=(0, 6))
-        label(c, title, 15, "bold").pack(anchor="w", padx=18, pady=(16, 0))
+        c = card(self._tab)
+        c.pack(fill="x", pady=(0, 14), padx=(0, 6))
+        label(c, title, 16, "bold").pack(anchor="w", padx=20, pady=(18, 0))
         if hint:
-            label(c, hint, 12, color=C["muted"], wraplength=760, justify="left").pack(anchor="w", padx=18)
+            label(c, hint, 12, color=C["muted"], wraplength=820, justify="left").pack(anchor="w", padx=20, pady=(2, 0))
         body = ctk.CTkFrame(c, fg_color="transparent")
-        body.pack(fill="x", padx=18, pady=(10, 16))
+        body.pack(fill="x", padx=20, pady=(10, 18))
+        body.grid_columnconfigure(0, minsize=int(250 * self.app.scale))
         body.grid_columnconfigure(2, weight=1)
         return body
 
@@ -2882,24 +2980,15 @@ class SettingsPage(Page):
     def _build(self):
         cfg = self.app.config_data
         if cfg is None:
-            label(self.scroll, "config.json could not be loaded. Fix it, then reopen this page.", 14,
+            label(self.tab_frames["General"], "config.json could not be loaded. Fix it, then reopen this page.", 14,
                   color=C["danger"]).pack(anchor="w", pady=20)
             return
 
-        b = self._section("Appearance", "Pick an accent color. It changes right away.")
-        row = ctk.CTkFrame(b, fg_color="transparent")
-        row.grid(row=0, column=0, columnspan=3, sticky="w")
-        current = self.app.prefs.get("accent", "Indigo")
-        for name, colors in ACCENTS.items():
-            ctk.CTkButton(row, text="", width=38, height=38, corner_radius=19, fg_color=colors[0], hover_color=colors[1],
-                          border_width=3 if name == current else 0, border_color="#ffffff",
-                          command=lambda n=name: self.app.after(40, lambda: self.app.set_accent(n))).pack(side="left", padx=(0, 10))
-        label(b, f"Current: {current}", 12, color=C["muted"]).grid(row=1, column=0, sticky="w", pady=(8, 0))
-
+        self._tab = self.tab_frames["General"]
         b = self._section("You")
         self._field(b, 0, "display_name", "Your name", cfg.get("display_name", ""), hint="Used in the dashboard greeting")
         self._field(b, 1, "summary_email_to", "Send reports to", cfg.get("summary_email_to"))
-        self.email_html = ctk.CTkSwitch(b, text="Send the weekly report as a styled HTML email (plain text is always included)",
+        self.email_html = switch(b, text="Send the weekly report as a styled HTML email (plain text is always included)",
                                         progress_color=C["accent"], font=font(13))
         if cfg.get("email_html", True):
             self.email_html.select()
@@ -2917,6 +3006,7 @@ class SettingsPage(Page):
                     ", ".join(str(m) for m in core.reminder_list(cfg)), width=160,
                     hint="Comma separated. 60, 30 = 1 hour and 30 min before")
 
+        self._tab = self.tab_frames["Jobs & pay"]
         b = self._section("Jobs & pay", "Any calendar event whose title contains the match text counts as that job. "
                           "Turn on back-to-back OK when a job splits shifts for a break.")
         self.jobs_box = b
@@ -2934,17 +3024,15 @@ class SettingsPage(Page):
         b = self._section("Pay schedule", "Optional. Adds a Pay periods view to Earnings and shows your next payday.")
         sched = cfg.get("pay_schedule") or {}
         label(b, "How often you're paid", 13, color=C["muted"]).grid(row=0, column=0, sticky="w", pady=6, padx=(0, 16))
-        self.pay_type = ctk.CTkOptionMenu(b, values=list(core.PAY_TYPES), width=160, height=34, fg_color=C["card2"],
-                                          button_color=C["card2"], button_hover_color=C["border"],
-                                          dropdown_fg_color=C["card"], text_color=C["text"], font=font(13))
+        self.pay_type = option_menu(b, list(core.PAY_TYPES), width=170)
         self.pay_type.set(sched.get("type", "off") if sched.get("type") in core.PAY_TYPES else "off")
         self.pay_type.grid(row=0, column=1, sticky="w", pady=6)
         self._field(b, 1, "pay_start", "A pay period start date", core.fmt_date(date.fromisoformat(sched["start"]))
                     if sched.get("start") else "", width=140, hint="Any first day of a pay period (weekly / every two weeks).")
         self._field(b, 2, "pay_delay", "Days from period end to payday", int(sched.get("delay_days") or 0), width=100)
 
+        self._tab = self.tab_frames["Alerts"]
         b = self._section("Conflict alerts", "Overlaps are always flagged. Gaps shorter than these are called out.")
-        self.rest_section = b
         th = cfg.get("conflict_thresholds_minutes", {})
         self._field(b, 0, "very_close", "Very close (minutes)", th.get("very_close", 30), width=100)
         self._field(b, 1, "close", "Close (minutes)", th.get("close", 60), width=100)
@@ -2960,8 +3048,9 @@ class SettingsPage(Page):
         self._field(b, 2, "school_exceptions", "Never treat as school", ", ".join(cfg.get("school_exceptions", [])),
                     hint="Comma separated titles")
 
+        self._tab = self.tab_frames["General"]
         b = self._section("App")
-        self.auto_email = ctk.CTkSwitch(b, text="Check Gmail for a new schedule when the app opens",
+        self.auto_email = switch(b, text="Check Gmail for a new schedule when the app opens",
                                         progress_color=C["accent"], font=font(13), command=self._toggle_auto)
         if self.app.prefs.get("auto_check_email", True):
             self.auto_email.select()
@@ -2971,7 +3060,7 @@ class SettingsPage(Page):
                           "Keeps your settings and import history the same on every computer signed in to this Google account. "
                           "Your calendar events are already shared by Google Calendar. Sync uses a private calendar called "
                           "\"Schedule Manager sync data\" (you can hide it, but please don't delete it).")
-        self.sync_switch = ctk.CTkSwitch(b, text="Sync this computer", progress_color=C["accent"], font=font(13),
+        self.sync_switch = switch(b, text="Sync this computer", progress_color=C["accent"], font=font(13),
                                          command=self._toggle_sync)
         if sync.enabled(self.app.config_data):
             self.sync_switch.select()
@@ -2982,7 +3071,8 @@ class SettingsPage(Page):
         self.sync_lbl.grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
         self.show_sync_status()
 
-        b = self._section("Connection & portability", "Everything lives in this folder, so you can copy it to another computer.")
+        self._tab = self.tab_frames["Data"]
+        b = self._section("Connection & data", "Everything for this computer is stored in one folder. Settings and history also sync through your Google account.")
         self.conn_lbl = label(b, "", 12, color=C["muted"], wraplength=700, justify="left", anchor="w")
         self.conn_lbl.grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
         row = ctk.CTkFrame(b, fg_color="transparent")
@@ -3003,7 +3093,7 @@ class SettingsPage(Page):
         m.insert(0, match)
         w = entry(self.jobs_box, width=90, placeholder="0.00")
         w.insert(0, f"{wage:g}" if wage else "")
-        sw = ctk.CTkSwitch(self.jobs_box, text="Back-to-back OK", progress_color=C["accent"], font=font(12))
+        sw = switch(self.jobs_box, text="Back-to-back OK", progress_color=C["accent"], font=font(12))
         if brk:
             sw.select()
         for col, wdg in enumerate([n, m, w, sw]):
@@ -3207,41 +3297,62 @@ class HelpPage(Page):
               "Run 'Create Desktop Shortcut.bat' to get the Desktop and Start menu icons.",
               "If Google asks you to sign in again, that's normal. Settings and history sync from your Google account."]
 
+    TABS = ["Updates", "What's new", "Shortcuts", "This computer"]
+
     def __init__(self, master, app):
         super().__init__(master, app)
         self.build_header("About & help", f"Schedule Manager v{core.APP_VERSION}")
-        self.scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        self.tab_bar = segmented(self, self.TABS, self._show_tab, size=13)
+        self.tab_bar.pack(anchor="w", pady=(0, 16))
+        self.scroll = scroll_frame(self, fg_color="transparent")
         self.scroll.pack(fill="both", expand=True)
-        self._built = False
+        self.tab_frames = {name: ctk.CTkFrame(self.scroll, fg_color="transparent") for name in self.TABS}
+        self.tab_bar.set(self.TABS[0])
+        self.tab_frames[self.TABS[0]].pack(fill="x")
+        self._stamp = None
+
+    def _show_tab(self, name):
+        for frame in self.tab_frames.values():
+            frame.pack_forget()
+        self.tab_frames[name].pack(fill="x")
+        self.scroll._parent_canvas.yview_moveto(0)
 
     def on_show(self):
-        for w in self.scroll.winfo_children():
-            w.destroy()
-        self._build()
+        """Built once, and again only if the settings or the latest backup changed."""
+        latest = core.latest_backup()
+        stamp = (latest.name if latest else None, self.app.config_stamp)
+        if self._stamp != stamp:
+            self._stamp = stamp
+            self._rebuild()
 
     def refresh(self):
-        self.on_show()
+        self._rebuild()
+
+    def _rebuild(self):
+        for frame in self.tab_frames.values():
+            for w in frame.winfo_children():
+                w.destroy()
+        self._build()
 
     def _section(self, title):
-        c = card(self.scroll)
-        c.pack(fill="x", pady=(0, 12), padx=(0, 6))
-        label(c, title, 15, "bold").pack(anchor="w", padx=18, pady=(16, 6))
+        c = card(self._tab)
+        c.pack(fill="x", pady=(0, 14), padx=(0, 6))
+        label(c, title, 16, "bold").pack(anchor="w", padx=20, pady=(18, 8))
         body = ctk.CTkFrame(c, fg_color="transparent")
-        body.pack(fill="x", padx=18, pady=(0, 16))
+        body.pack(fill="x", padx=20, pady=(0, 18))
         return body
 
     WHATS_NEW = [
+        "A new look, and the app opens filling the screen (F11 for true fullscreen). Scrolling is smoother.",
         "Import shows what will change before you confirm: new shifts, ones already on your calendar, and any conflicts.",
-        "Updated schedules are recognised, and shifts are never added twice.",
         "Drag events in the Week view to move or resize them, or drag on empty space to add one. Undo is always there.",
         "Today timeline on the dashboard, Month view, Find (Ctrl+F) and a command palette (Ctrl+K).",
         "Study planner: finds free time around classes and shifts and adds the blocks you pick.",
         "Earnings by week, month or pay period, with take-home and next payday.",
-        "Weekly email is now styled HTML (plain text is included too). Preview it from the Report page.",
-        "Accent colors under Settings, short-rest alerts, an optional weekly hours goal.",
+        "The weekly email is styled HTML, with short-rest alerts and an optional weekly hours goal.",
         "Works offline, backs itself up daily, and refreshes while you leave it open.",
-        "Settings and import history sync between computers through your Google account (Settings > Sync).",
-        "Updates: publish from your main computer and every other install offers it under About & help > Updates.",
+        "Settings and import history sync between computers through your Google account (Settings > General).",
+        "Updates: publish from your main computer and every other install offers it here under Updates.",
     ]
 
     def show_update_status(self):
@@ -3265,42 +3376,44 @@ class HelpPage(Page):
         save_prefs(self.app.prefs)
 
     def _build(self):
-        b = self._section("What's new in v2")
-        for line in self.WHATS_NEW:
-            label(b, "\u2022  " + line, 13, color=C["muted"], wraplength=780, justify="left", anchor="w").pack(anchor="w", pady=2)
-
+        self._tab = self.tab_frames["Updates"]
         b = self._section("Updates")
         info = updater.read_build_info() if updater.is_installed() else None
         self.version_lbl = label(b, updater.describe_build(info) if info else
                                  f"Version {core.APP_VERSION}. This copy runs from the source folder, so it doesn't update itself.",
-                                 13, color=C["muted"], anchor="w")
+                                 14, "bold", anchor="w")
         self.version_lbl.grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
         label(b, "New versions are published from the computer where the code is changed and arrive through your own Gmail. "
-                 "Nothing is installed without you saying so.", 12, color=C["muted"], wraplength=760, justify="left",
-              anchor="w").grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 6))
-        self.update_auto = ctk.CTkSwitch(b, text="Look for updates automatically", progress_color=C["accent"], font=font(13),
-                                         command=self._toggle_update_auto)
+                 "Nothing is installed without you saying so.", 12, color=C["muted"], wraplength=820, justify="left",
+              anchor="w").grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 10))
+        self.update_auto = switch(b, text="Look for updates automatically", command=self._toggle_update_auto)
         if self.app.prefs.get("auto_check_updates", True):
             self.update_auto.select()
         self.update_auto.grid(row=2, column=0, sticky="w", pady=4)
         self.update_check_btn = button(b, "Check for updates", lambda: self.app.check_updates(manual=True), "normal", width=160)
-        self.update_check_btn.grid(row=2, column=1, sticky="w", padx=(16, 0))
+        self.update_check_btn.grid(row=2, column=1, sticky="w", padx=(20, 0))
         self.update_now_btn = button(b, "Update now", self.app.offer_update, "primary", width=120)
         self.update_now_btn.grid(row=2, column=2, sticky="w", padx=(8, 0))
-        self.update_lbl = label(b, "", 12, color=C["muted"], wraplength=760, justify="left", anchor="w")
-        self.update_lbl.grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        self.update_lbl = label(b, "", 12, color=C["muted"], wraplength=820, justify="left", anchor="w")
+        self.update_lbl.grid(row=3, column=0, columnspan=4, sticky="w", pady=(8, 0))
         self.show_update_status()
 
-        b = self._section("Keyboard & mouse")
-        for keys, what in self.SHORTCUTS:
-            row = ctk.CTkFrame(b, fg_color="transparent")
-            row.pack(fill="x", pady=2)
-            label(row, keys, 13, "bold", C["accent"], width=250, anchor="w").pack(side="left")
-            label(row, what, 13, color=C["muted"]).pack(side="left")
+        self._tab = self.tab_frames["What's new"]
+        b = self._section("What's new in v2")
+        label(b, "\n\n".join("\u2022  " + line for line in self.WHATS_NEW), 13, color=C["muted"], wraplength=860,
+              justify="left", anchor="w").pack(anchor="w")
 
+        self._tab = self.tab_frames["Shortcuts"]
+        b = self._section("Keyboard & mouse")
+        keys = "\n\n".join(k for k, _ in self.SHORTCUTS)
+        what = "\n\n".join(w for _, w in self.SHORTCUTS)
+        label(b, keys, 13, "bold", C["accent_hover"], justify="left", anchor="nw").pack(side="left", anchor="n")
+        label(b, what, 13, color=C["muted"], justify="left", anchor="nw").pack(side="left", anchor="n", padx=(36, 0))
+
+        self._tab = self.tab_frames["This computer"]
         b = self._section("Moving to another computer")
-        for i, step in enumerate(self.MOVING, start=1):
-            label(b, f"{i}.  {step}", 13, color=C["muted"], wraplength=780, justify="left", anchor="w").pack(anchor="w", pady=2)
+        label(b, "\n\n".join(f"{i}.  {step}" for i, step in enumerate(self.MOVING, start=1)), 13, color=C["muted"],
+              wraplength=860, justify="left", anchor="w").pack(anchor="w")
 
         b = self._section("Your data")
         latest = core.latest_backup()
@@ -3311,15 +3424,14 @@ class HelpPage(Page):
                 ("History & imports", "state.json   (backed up automatically once a day)"),
                 ("Latest backup", latest.name if latest else "none yet"),
                 ("Login", "token.json stays in this folder; 'Reset Google login' in Settings signs you out")]
-        for k, v in rows:
-            row = ctk.CTkFrame(b, fg_color="transparent")
-            row.pack(fill="x", pady=2)
-            label(row, k, 13, "bold", width=170, anchor="w").pack(side="left")
-            label(row, v, 13, color=C["muted"], wraplength=620, justify="left", anchor="w").pack(side="left")
+        b.grid_columnconfigure(1, weight=1)
+        for i, (k, v) in enumerate(rows):
+            label(b, k, 13, "bold", anchor="w").grid(row=i, column=0, sticky="nw", pady=4, padx=(0, 30))
+            label(b, v, 13, color=C["muted"], wraplength=640, justify="left", anchor="w").grid(row=i, column=1, sticky="nw", pady=4)
 
         b = self._section("Diagnostics")
         label(b, "If something looks wrong, copy the diagnostics and send them along with a description.", 13,
-              color=C["muted"], wraplength=780, justify="left", anchor="w").pack(anchor="w", pady=(0, 8))
+              color=C["muted"], wraplength=860, justify="left", anchor="w").pack(anchor="w", pady=(0, 10))
         row = ctk.CTkFrame(b, fg_color="transparent")
         row.pack(fill="x")
         button(row, "Copy diagnostics", self.copy_diagnostics, "normal").pack(side="left", padx=(0, 8))

@@ -116,6 +116,7 @@ class WeekGrid(ctk.CTkFrame):
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<Motion>", self._on_hover)
         self._first_draw = True
+        self.scroller = None  # the app sets this to its Scroller
 
     def set_data(self, week_start: date, days: dict, conflicts: dict):
         self.week_start = week_start
@@ -123,10 +124,6 @@ class WeekGrid(ctk.CTkFrame):
         self.conflicts = conflicts
         self.selected_id = None
         self._first_draw = True
-        self.redraw()
-
-    def clear_selection(self):
-        self.selected_id = None
         self.redraw()
 
     def _hour_range(self):
@@ -263,8 +260,12 @@ class WeekGrid(ctk.CTkFrame):
             self.after(30, lambda: self.canvas.yview_moveto(min(target, 0.9)))
 
     def _on_wheel(self, event):
-        px = int(-event.delta / 120 * 75 * self.s)  # ~3 lines per notch; small trackpad deltas still move
-        self.canvas.yview_scroll(px or (-1 if event.delta > 0 else 1), "units")
+        distance = -event.delta / 120 * 96 * self.s  # about three lines per notch
+        if self.scroller is not None:
+            self.scroller.add(self.canvas, distance)  # eased and coalesced, like every other scrolling area
+        else:
+            px = int(distance)
+            self.canvas.yview_scroll(px or (-1 if event.delta > 0 else 1), "units")
 
     def _block_at(self, x, y):
         for ex1, y1, ex2, y2, ev in reversed(self._blocks):

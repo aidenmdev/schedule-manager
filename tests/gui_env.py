@@ -1,5 +1,6 @@
 """Runs the real GUI against fake Google services and an isolated temp config/state (nothing real is touched)."""
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -70,6 +71,7 @@ class Env:
 
     # ---- patching ----
     def install(self):
+        os.environ["SCHEDULE_MANAGER_HIDDEN"] = "1"   # windows stay invisible while tests run
         import schedule_gui as g
         self.g = g
         pairs = [(core, "BASE_DIR", self.tmp), (core, "CONFIG_PATH", self.cfg_path), (core, "STATE_PATH", self.tmp / "state.json"),

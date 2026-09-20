@@ -117,7 +117,7 @@ class MailTests(Case):
         self.assertEqual(check.available.build, BASE + 10)
         self.assertEqual(check.available.notes, "Fixed the thing.")
         self.assertEqual(check.available.version, "2.0")
-        self.assertEqual(updater.download(self.mail, check.available), package)
+        self.assertEqual(updater.download(self.mail, check.available, public_key=self.public), package)
 
     def test_large_updates_are_split_across_messages_and_reassembled(self):
         saved = updater.PART_BYTES
@@ -129,12 +129,12 @@ class MailTests(Case):
             updater.PART_BYTES = saved
         self.assertGreater(sent, 3)
         subjects = [m["subject"] for m in self.mail.stored.values()]
-        self.assertTrue(all(s.startswith(updater.SUBJECT_TAG) for s in subjects))
+        self.assertTrue(all(s.startswith(updater.PACKAGE_TAG) for s in subjects))
         self.assertIn(f"(part 1 of {sent})", subjects[0])
         update = self.check().available
         self.assertEqual(len(update.parts), sent)
         seen = []
-        self.assertEqual(updater.download(self.mail, update, lambda i, n: seen.append((i, n))), package)
+        self.assertEqual(updater.download(self.mail, update, lambda i, n: seen.append((i, n)), public_key=self.public), package)
         self.assertEqual(seen[-1], (sent, sent))
 
     def test_the_package_travels_as_text_not_as_a_binary_attachment(self):
@@ -159,7 +159,7 @@ class MailTests(Case):
         big, manifest, _, _ = self.new_build("g", BASE + 2, {"_internal/data.json": os.urandom(3_000_000)})
         self.publish(big, manifest)
         self.assertEqual(self.mail.media_sends, 1)
-        self.assertEqual(updater.download(self.mail, self.check().available), big)
+        self.assertEqual(updater.download(self.mail, self.check().available, public_key=self.public), big)
 
     def test_newest_complete_update_wins(self):
         for build, text in ((BASE + 5, "v5"), (BASE + 9, "v9")):
@@ -213,7 +213,115 @@ class MailTests(Case):
         key = next(iter(self.mail.attachment_data))
         self.mail.attachment_data[key] = b"@@@ not base64 @@@"
         with self.assertRaises(updater.UpdateError):
-            updater.download(self.mail, self.check().available)
+            updater.download(self.mail, self.check().available, public_key=self.public)
+
+
+class TransportTests(Case):
+    """Gmail refuses to deliver a message whose attachment is a zip holding a program, so packages travel encrypted."""
+
+    def wire(self):
+        return [self.mail.attachment_data[k] for k in sorted(self.mail.attachment_data)]
+
+    def test_the_attachment_does_not_look_like_a_zip_or_a_program(self):
+        package, manifest, _, _ = self.new_build("b1", BASE + 10, {"ScheduleManager.exe": "MZ" + "x" * 500})
+        self.publish(package, manifest)
+        decoded = base64.b64decode("".join(self.wire()[0].decode("ascii").split()))
+        self.assertTrue(decoded.startswith(updater.SEAL_MAGIC))
+        self.assertNotEqual(decoded[:2], b"PK")
+        self.assertNotIn(b"PK\x03\x04", decoded)
+        self.assertNotIn(b"manifest.json", decoded)
+        self.assertNotIn(package[:64], decoded)
+
+    def test_messages_use_the_package_tag_and_machine_line(self):
+        package, manifest, _, _ = self.new_build("b1", BASE + 10, {"ScheduleManager.exe": "v"})
+        self.publish(package, manifest)
+        message = next(iter(self.mail.stored.values()))
+        self.assertTrue(message["subject"].startswith(updater.PACKAGE_TAG))
+        self.assertNotIn("update]", message["subject"].lower().replace("package", ""))
+        body = base64.urlsafe_b64decode(message["payload"]["parts"][0]["body"]["data"]).decode()
+        self.assertIn("SM-PACKAGE ", body)
+        self.assertNotIn("SM-UPDATE ", body)
+
+    def test_round_trip_needs_the_right_key(self):
+        package, manifest, _, _ = self.new_build("b1", BASE + 10, {"ScheduleManager.exe": "v"})
+        self.publish(package, manifest)
+        update = self.check().available
+        self.assertEqual(update.enc, "aesgcm1")
+        self.assertEqual(updater.download(self.mail, update, public_key=self.public), package)
+        with self.assertRaises(updater.UpdateError):
+            updater.download(self.mail, update)
+        updater.generate_keys(self.root / "other")
+        other = updater.load_public_key(self.root / "other" / updater.KEY_NAME)
+        with self.assertRaises(updater.UpdateError):
+            updater.download(self.mail, update, public_key=other)
+
+    def test_a_tampered_ciphertext_is_refused(self):
+        key = updater.transport_key(self.public)
+        sealed = updater.seal(b"payload bytes", key)
+        self.assertEqual(updater.unseal(sealed, key), b"payload bytes")
+        damaged = bytearray(sealed)
+        damaged[-1] ^= 1
+        with self.assertRaises(updater.UpdateError):
+            updater.unseal(bytes(damaged), key)
+        with self.assertRaises(updater.UpdateError):
+            updater.unseal(b"short", key)
+        with self.assertRaises(updater.UpdateError):
+            updater.unseal(b"not sealed at all, just long enough to pass the length check........", key)
+
+    def test_every_seal_is_different(self):
+        key = updater.transport_key(self.public)
+        self.assertNotEqual(updater.seal(b"same", key), updater.seal(b"same", key))
+
+    def test_old_installs_never_see_the_encrypted_messages(self):
+        package, manifest, _, _ = self.new_build("b1", BASE + 10, {"ScheduleManager.exe": "v"})
+        self.publish(package, manifest)
+        old_query = self.mail.list(userId="me", q=f'from:me subject:"{updater.SUBJECT_TAG}" has:attachment').execute()
+        self.assertEqual(old_query["messages"], [])
+
+    def test_legacy_option_also_sends_the_old_plain_copy(self):
+        package, manifest, _, _ = self.new_build("b1", BASE + 10, {"ScheduleManager.exe": "v"}, notes="Both formats.")
+        self.assertEqual(updater.publish(self.mail, package, manifest, self.private, legacy=True), 2)
+        subjects = sorted(m["subject"].split(" 2.0")[0] for m in self.mail.stored.values())
+        self.assertEqual(subjects, [updater.PACKAGE_TAG, updater.SUBJECT_TAG])
+        old_query = self.mail.list(userId="me", q=f'from:me subject:"{updater.SUBJECT_TAG}" has:attachment').execute()
+        self.assertEqual(len(old_query["messages"]), 1)
+        legacy_id = old_query["messages"][0]["id"]
+        # what an install from before the change would do with the plain copy: read the attachment and check the hash
+        att_id = next(p["body"]["attachmentId"] for p in self.mail.stored[legacy_id]["payload"]["parts"] if p["filename"])
+        raw = base64.b64decode("".join(self.mail.attachment_data[(legacy_id, att_id)].decode().split()))
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), manifest_sha(package))
+        # a current install prefers the encrypted copy of the same build
+        update = self.check().available
+        self.assertEqual(update.enc, "aesgcm1")
+        self.assertEqual(updater.download(self.mail, update, public_key=self.public), package)
+
+    def test_the_plain_format_is_still_readable(self):
+        package, manifest, _, _ = self.new_build("b1", BASE + 10, {"ScheduleManager.exe": "v"})
+        sig = updater.sign(self.private, manifest["build"], manifest["base"], hashlib.sha256(package).hexdigest())
+        for mime in updater.build_messages(package, manifest, sig, "me@example.com"):
+            updater.send_mime(self.mail, mime)
+        update = self.check().available
+        self.assertEqual(update.enc, "")
+        self.assertEqual(updater.download(self.mail, update), package)
+
+    def test_messages_in_the_trash_are_still_found(self):
+        package, manifest, _, _ = self.new_build("b1", BASE + 10, {"ScheduleManager.exe": "v"})
+        self.publish(package, manifest)
+        for message in self.mail.stored.values():
+            message["trashed"] = True
+        self.assertEqual(self.check().available.build, BASE + 10)
+
+    def test_bounce_notices_from_gmail_are_ignored(self):
+        package, manifest, _, _ = self.new_build("b1", BASE + 10, {"ScheduleManager.exe": "v"})
+        self.publish(package, manifest)
+        self.mail.add_plain(f"Re: {updater.SUBJECT_TAG} 2.0 build {BASE + 10} (part 1 of 1)",
+                            "For security reasons, Gmail does not allow you to use this type of file.\n\nSM-UPDATE {broken",
+                            sender="Mail Delivery Subsystem <mailer-daemon@googlemail.com>")
+        self.assertEqual(self.check().available.build, BASE + 10)
+
+
+def manifest_sha(package: bytes) -> str:
+    return hashlib.sha256(package).hexdigest()
 
 
 class StageTests(Case):

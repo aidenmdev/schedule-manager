@@ -388,9 +388,10 @@ class FakeMailbox:
         def go():
             self._check()
             import re as _re
-            subject = _re.search(r'subject:"([^"]+)"', q or "")
+            phrases = _re.findall(r'subject:"([^"]+)"', q or "")
             hits = [m for m in self.stored.values()
-                    if (not subject or subject.group(1) in m["subject"])
+                    if (not phrases or any(ph in m["subject"] for ph in phrases))
+                    and (kw.get("includeSpamTrash") or not m.get("trashed"))
                     and ("from:me" not in (q or "") or m["from"] == self.address)
                     and ("has:attachment" not in (q or "") or any(p.get("filename") for p in m["payload"].get("parts", [])))]
             return {"messages": [{"id": m["id"]} for m in reversed(hits)][:maxResults]}

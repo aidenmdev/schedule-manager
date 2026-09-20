@@ -97,7 +97,7 @@ class GuiSyncTests(unittest.TestCase):
                 "calendar_id": "primary", "event_ids": ["x1"], "shift_keys": ["k1"]}
         (d / "state.json").write_text(json.dumps({"weeks": {"2026-10-05": week}, "imported_shift_keys": ["k1"], "history": [
             {"action": "import", "timestamp": "2026-09-19T20:00:00", "week": "2026-10-05", "event_ids": ["x1"]}]}), encoding="utf-8")
-        (d / "gui_prefs.json").write_text(json.dumps({"accent": "Rose"}), encoding="utf-8")
+        (d / "gui_prefs.json").write_text(json.dumps({"plan_title": "Read"}), encoding="utf-8")
         sync.sync_once(self.acct, files, now=datetime.now(timezone.utc))
         app.sync_now(manual=True)
         pump(app, 3.0)
@@ -105,7 +105,7 @@ class GuiSyncTests(unittest.TestCase):
         self.assertIn("2026-10-05", app.store.data["weeks"])
         self.assertEqual(app.config_data["weekly_hours_goal"], 30)
         self.assertEqual(app.config_data["job_wages"]["Dominos"], 21.5)
-        self.assertEqual(app.prefs["accent"], "Rose")
+        self.assertEqual(app.prefs["plan_title"], "Read")
         self.assertEqual(json.loads(core.CONFIG_PATH.read_text(encoding="utf-8"))["sync_enabled"], True)
         for key, _title in self.env.g.App.NAV:
             app.show_page(key)
