@@ -11,7 +11,7 @@ import customtkinter as ctk
 
 import dominos_schedule as core
 import updater
-from tests.fakes import FakeMailbox
+from tests.fakes import LocalRepo
 from tests.gui_env import Env, find_widgets, pump
 from tests.test_updater import BASE, INSTALLER, make_tree
 
@@ -20,8 +20,8 @@ class GuiUpdateTests(unittest.TestCase):
     def setUp(self):
         self.env = Env().install()
         g = self.env.g
-        self.mail = FakeMailbox()
         self.root = self.env.tmp
+        self.repo = LocalRepo(self.root / "remote.git")
         updater.generate_keys(self.root / "keys")
         self.private = updater.load_private_key(self.root / "keys" / "update_signing_key.pem")
         self.device = make_tree(self.root / "installed", INSTALLER)
@@ -30,12 +30,12 @@ class GuiUpdateTests(unittest.TestCase):
         self.relaunched = []
 
         self.saved = {"is_installed": updater.is_installed, "read_build_info": updater.read_build_info,
-                      "resource": core.RESOURCE_DIR, "svc": g.App._update_service, "dir": g.App._install_dir,
+                      "resource": core.RESOURCE_DIR, "get": updater.http_get, "dir": g.App._install_dir,
                       "relaunch": g.App._relaunch, "tablet": g.App._tablet_running}
         updater.is_installed = lambda: True
         updater.read_build_info = lambda *a: self.info
         core.RESOURCE_DIR = self.root / "keys"
-        g.App._update_service = lambda app: self.mail
+        updater.http_get = self.repo.fetch      # the app reads GitHub through this
         g.App._install_dir = lambda app: self.device
         g.App._relaunch = lambda app, script: self.relaunched.append(script)
         g.App._tablet_running = lambda app: False
@@ -45,7 +45,7 @@ class GuiUpdateTests(unittest.TestCase):
         g = self.env.g
         updater.is_installed, updater.read_build_info = self.saved["is_installed"], self.saved["read_build_info"]
         core.RESOURCE_DIR = self.saved["resource"]
-        g.App._update_service, g.App._install_dir = self.saved["svc"], self.saved["dir"]
+        updater.http_get, g.App._install_dir = self.saved["get"], self.saved["dir"]
         g.App._relaunch, g.App._tablet_running = self.saved["relaunch"], self.saved["tablet"]
         for app in self.apps:
             try:
@@ -67,7 +67,7 @@ class GuiUpdateTests(unittest.TestCase):
         files.update(changes)
         tree = make_tree(self.root / f"build{build}", files)
         package, manifest, _ = updater.build_package(tree, self.baseline, updater.BuildInfo("2.0", build, BASE), notes, set())
-        updater.publish(self.mail, package, manifest, self.private)
+        updater.publish(package, manifest, self.private, self.repo.path)
 
     def wait_for(self, app, predicate, seconds=6):
         end = time.time() + seconds
@@ -120,11 +120,11 @@ class GuiUpdateTests(unittest.TestCase):
 
     def test_offline_is_quiet_and_recovers(self):
         app = self.start(prefs={"seen_build": BASE})
-        self.mail.offline = True
+        self.repo.offline = True
         app.check_updates()
         self.assertTrue(self.wait_for(app, lambda: "Offline" in app.update_text))
         self.assertEqual(self.env.errors, "")
-        self.mail.offline = False
+        self.repo.offline = False
         app.check_updates(manual=True)
         self.assertTrue(self.wait_for(app, lambda: "up to date" in app.update_text))
 
@@ -150,14 +150,14 @@ class GuiUpdateTests(unittest.TestCase):
         evil = updater.load_private_key(self.root / "evil" / "update_signing_key.pem")
         tree = make_tree(self.root / "evilbuild", {**INSTALLER, "ScheduleManager.exe": "malware"})
         package, manifest, _ = updater.build_package(tree, self.baseline, updater.BuildInfo("2.0", BASE + 100, BASE), "", set())
-        updater.publish(self.mail, package, manifest, evil)
+        updater.publish(package, manifest, evil, self.repo.path)
         app.check_updates(manual=True)
         self.assertTrue(self.wait_for(app, lambda: app.update_check is not None))
         toasts = []
         original = app.toast
         app.toast = lambda text, *a, **k: (toasts.append(text), original(text, *a, **k))[1]
         app.install_update(app.update_check.available)
-        self.assertTrue(self.wait_for(app, lambda: any("not signed" in t or "wasn't made by your build computer" in t for t in toasts)))
+        self.assertTrue(self.wait_for(app, lambda: any("not signed" in t for t in toasts)))
         self.assertEqual(self.relaunched, [])
 
     def test_a_copy_running_from_source_does_not_update(self):

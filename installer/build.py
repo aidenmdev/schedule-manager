@@ -35,6 +35,12 @@ def app_version() -> str:
     return re.search(r'APP_VERSION\s*=\s*"([^"]+)"', text).group(1)
 
 
+def repo_name() -> str:
+    """The GitHub project updates are published to and read from (owner/name)."""
+    saved = RELEASE / "repo.txt"
+    return saved.read_text(encoding="utf-8").strip() if saved.exists() else updater.DEFAULT_REPO
+
+
 def new_build_number() -> int:
     return int(datetime.now().strftime("%Y%m%d%H%M%S"))
 
@@ -60,7 +66,7 @@ def build_app(info: "updater.BuildInfo") -> Path:
         shutil.rmtree(folder, ignore_errors=True)
     BUILD.mkdir(exist_ok=True)
     info_file = BUILD / updater.BUILD_INFO_NAME
-    info_file.write_text(json.dumps({"version": info.version, "build": info.build, "base": info.base}), encoding="utf-8")
+    info_file.write_text(json.dumps({"version": info.version, "build": info.build, "base": info.base, "repo": info.repo}), encoding="utf-8")
     cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--windowed", "--name", "ScheduleManager",
            "--icon", ROOT / "app.ico", "--distpath", DIST / "app", "--workpath", BUILD / "app", "--specpath", BUILD,
            "--paths", ROOT, "--collect-data", "customtkinter", "--collect-data", "tzdata", "--collect-data", "httplib2",
@@ -108,7 +114,7 @@ def main() -> None:
     for folder in (DIST, BUILD):
         shutil.rmtree(folder, ignore_errors=True)
     build = new_build_number()
-    info = updater.BuildInfo(app_version(), build, base=build)  # a new installer starts a new update line
+    info = updater.BuildInfo(app_version(), build, base=build, repo=repo_name())  # a new installer starts a new update line
     app_dir = build_app(info)
     RELEASE.mkdir(exist_ok=True)
     (RELEASE / "baseline.json").write_text(

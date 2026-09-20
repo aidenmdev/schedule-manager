@@ -1,5 +1,4 @@
 """Publishing, finding, verifying and applying updates. Run:  .venv\\Scripts\\python.exe -m unittest tests.test_updater -v"""
-import base64
 import hashlib
 import io
 import json
@@ -14,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import updater
-from tests.fakes import FakeMailbox
+from tests.fakes import LocalRepo
 
 BASE = 20260101000000
 
@@ -39,7 +38,7 @@ class Case(unittest.TestCase):
         self.private = updater.load_private_key(self.root / "keys" / "update_signing_key.pem")
         self.public = updater.load_public_key(self.root / "keys" / updater.KEY_NAME)
         self.baseline = updater.tree_manifest(make_tree(self.root / "baseline", INSTALLER))
-        self.mail = FakeMailbox()
+        self.repo = LocalRepo(self.root / "remote.git")
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -59,10 +58,13 @@ class Case(unittest.TestCase):
         return updater.build_package(tree, self.baseline, info, notes, set(ever or ())) + (tree,)
 
     def publish(self, package, manifest):
-        return updater.publish(self.mail, package, manifest, self.private)
+        updater.publish(package, manifest, self.private, self.repo.path)
 
     def check(self, build=BASE):
-        return updater.find_updates(self.mail, updater.BuildInfo("2.0", build, BASE))
+        return updater.find_updates(updater.BuildInfo("2.0", build, BASE), fetch=self.repo.fetch)
+
+    def download(self, update):
+        return updater.download(update, fetch=self.repo.fetch)
 
 
 class PackageTests(Case):
@@ -109,225 +111,136 @@ class SigningTests(Case):
         self.assertFalse(updater.signature_ok(self.public, 5, BASE, "abc", sig))
 
 
-class MailTests(Case):
-    def test_round_trip_through_a_mailbox(self):
+class ChannelTests(Case):
+    """Updates travel through a branch of the GitHub project."""
+
+    def test_round_trip(self):
         package, manifest, _, _ = self.new_build("b1", BASE + 10, {"ScheduleManager.exe": "exe v2"}, notes="Fixed the thing.")
-        self.assertEqual(self.publish(package, manifest), 1)
-        check = self.check()
-        self.assertEqual(check.available.build, BASE + 10)
-        self.assertEqual(check.available.notes, "Fixed the thing.")
-        self.assertEqual(check.available.version, "2.0")
-        self.assertEqual(updater.download(self.mail, check.available, public_key=self.public), package)
-
-    def test_large_updates_are_split_across_messages_and_reassembled(self):
-        saved = updater.PART_BYTES
-        updater.PART_BYTES = 700
-        try:
-            package, manifest, _, _ = self.new_build("b1", BASE + 10, {"_internal/data.json": os.urandom(5000)})
-            sent = self.publish(package, manifest)
-        finally:
-            updater.PART_BYTES = saved
-        self.assertGreater(sent, 3)
-        subjects = [m["subject"] for m in self.mail.stored.values()]
-        self.assertTrue(all(s.startswith(updater.PACKAGE_TAG) for s in subjects))
-        self.assertIn(f"(part 1 of {sent})", subjects[0])
+        self.publish(package, manifest)
         update = self.check().available
-        self.assertEqual(len(update.parts), sent)
-        seen = []
-        self.assertEqual(updater.download(self.mail, update, lambda i, n: seen.append((i, n)), public_key=self.public), package)
-        self.assertEqual(seen[-1], (sent, sent))
+        self.assertEqual((update.version, update.build, update.base), ("2.0", BASE + 10, BASE))
+        self.assertEqual(update.notes, "Fixed the thing.")
+        self.assertEqual(self.download(update), package)
 
-    def test_the_package_travels_as_text_not_as_a_binary_attachment(self):
-        package, manifest, _, _ = self.new_build("b1", BASE + 10, {"ScheduleManager.exe": "exe v2"})
-        self.publish(package, manifest)
-        message = next(iter(self.mail.stored.values()))
-        attachments = [p for p in message["payload"]["parts"] if p["filename"]]
-        self.assertEqual(len(attachments), 1)
-        self.assertTrue(attachments[0]["filename"].endswith(".txt"))
-        self.assertEqual(attachments[0]["mimeType"], "text/plain")
+    def test_the_requests_go_to_the_right_place_and_skip_the_cache(self):
+        self.check()
+        url = self.repo.requests[0]
+        self.assertTrue(url.startswith(f"https://raw.githubusercontent.com/{updater.DEFAULT_REPO}/updates/update.json?t="))
 
-    def test_wire_size_stays_well_under_gmails_limit(self):
-        package, manifest, _, _ = self.new_build("b1", BASE + 10, {"_internal/data.json": os.urandom(400_000)})
-        self.publish(package, manifest)
-        self.assertLess(max(self.mail.sent_sizes), 1.5 * len(package) + 20_000)
-        self.assertLess(updater.PART_BYTES * 1.4 * 1.4, 25 * 1024 * 1024)
+    def test_the_project_comes_from_the_build_info(self):
+        info = updater.BuildInfo("2.0", BASE, BASE, "someone/else")
+        updater.find_updates(info, fetch=self.repo.fetch)
+        self.assertIn("raw.githubusercontent.com/someone/else/updates/update.json", self.repo.requests[0])
 
-    def test_big_messages_use_the_upload_endpoint_and_small_ones_do_not(self):
-        small, manifest, _, _ = self.new_build("s", BASE + 1, {"ScheduleManager.exe": "tiny"})
-        self.publish(small, manifest)
-        self.assertEqual(self.mail.media_sends, 0)
-        big, manifest, _, _ = self.new_build("g", BASE + 2, {"_internal/data.json": os.urandom(3_000_000)})
-        self.publish(big, manifest)
-        self.assertEqual(self.mail.media_sends, 1)
-        self.assertEqual(updater.download(self.mail, self.check().available, public_key=self.public), big)
-
-    def test_newest_complete_update_wins(self):
+    def test_publishing_again_replaces_the_update_and_keeps_history_flat(self):
         for build, text in ((BASE + 5, "v5"), (BASE + 9, "v9")):
             package, manifest, _, _ = self.new_build(f"b{build}", build, {"ScheduleManager.exe": text})
             self.publish(package, manifest)
         self.assertEqual(self.check().available.build, BASE + 9)
+        import subprocess
+        count = subprocess.run(["git", "--git-dir", self.repo.path, "rev-list", "--count", "updates"], capture_output=True, text=True)
+        self.assertEqual(count.stdout.strip(), "1")
 
-    def test_up_to_date_and_older_updates_are_ignored(self):
+    def test_nothing_published_yet_means_up_to_date(self):
+        check = self.check()
+        self.assertIsNone(check.available)
+        self.assertIsNone(check.needs_new_installer)
+
+    def test_same_or_older_build_is_not_offered(self):
         package, manifest, _, _ = self.new_build("b1", BASE + 5, {"ScheduleManager.exe": "v5"})
         self.publish(package, manifest)
         self.assertIsNone(self.check(build=BASE + 5).available)
         self.assertIsNone(self.check(build=BASE + 6).available)
 
-    def test_incomplete_update_is_not_offered(self):
-        saved = updater.PART_BYTES
-        updater.PART_BYTES = 700
-        try:
-            package, manifest, _, _ = self.new_build("b1", BASE + 10, {"_internal/data.json": os.urandom(3000)})
-            self.publish(package, manifest)
-        finally:
-            updater.PART_BYTES = saved
-        del self.mail.stored[next(iter(self.mail.stored))]   # one part was deleted
-        self.assertIsNone(self.check().available)
-
     def test_update_from_a_different_installer_asks_for_the_new_installer(self):
         package, manifest, _, _ = self.new_build("b1", BASE + 10, {"ScheduleManager.exe": "v"})
-        manifest = dict(manifest, base=BASE + 999)
-        self.publish(package, manifest)
+        self.publish(package, dict(manifest, base=BASE + 999))
         check = self.check()
         self.assertIsNone(check.available)
         self.assertEqual(check.needs_new_installer.build, BASE + 10)
 
-    def test_ordinary_mail_and_other_senders_are_ignored(self):
-        self.mail.add_plain("Weekly Schedule 9/21", "hello")
-        self.mail.add_plain(f"{updater.SUBJECT_TAG} 2.0 build 99999999999999 (part 1 of 1)", "no machine line")
-        package, manifest, _, _ = self.new_build("b1", BASE + 10, {"ScheduleManager.exe": "v"})
-        self.publish(package, manifest)
-        self.mail.stored[list(self.mail.stored)[-1]]["from"] = "stranger@example.net"
-        self.assertIsNone(self.check().available)
+    def test_unreadable_update_information_is_reported(self):
+        for bad in (b"not json", b"{}", b'{"build": "x"}', b"\xff\xfe"):
+            with self.assertRaises(updater.UpdateError):
+                updater.parse_meta(bad, updater.DEFAULT_REPO)
 
     def test_offline_raises_a_network_error(self):
-        self.mail.offline = True
         import dominos_schedule as core
+        self.repo.offline = True
         with self.assertRaises(OSError) as ctx:
             self.check()
         self.assertTrue(core.is_network_error(ctx.exception))
 
-    def test_a_damaged_attachment_is_reported(self):
-        package, manifest, _, _ = self.new_build("b1", BASE + 10, {"ScheduleManager.exe": "v"})
-        self.publish(package, manifest)
-        key = next(iter(self.mail.attachment_data))
-        self.mail.attachment_data[key] = b"@@@ not base64 @@@"
-        with self.assertRaises(updater.UpdateError):
-            updater.download(self.mail, self.check().available, public_key=self.public)
-
-
-class TransportTests(Case):
-    """Gmail refuses to deliver a message whose attachment is a zip holding a program, so packages travel encrypted."""
-
-    def wire(self):
-        return [self.mail.attachment_data[k] for k in sorted(self.mail.attachment_data)]
-
-    def test_the_attachment_does_not_look_like_a_zip_or_a_program(self):
-        package, manifest, _, _ = self.new_build("b1", BASE + 10, {"ScheduleManager.exe": "MZ" + "x" * 500})
-        self.publish(package, manifest)
-        decoded = base64.b64decode("".join(self.wire()[0].decode("ascii").split()))
-        self.assertTrue(decoded.startswith(updater.SEAL_MAGIC))
-        self.assertNotEqual(decoded[:2], b"PK")
-        self.assertNotIn(b"PK\x03\x04", decoded)
-        self.assertNotIn(b"manifest.json", decoded)
-        self.assertNotIn(package[:64], decoded)
-
-    def test_messages_use_the_package_tag_and_machine_line(self):
-        package, manifest, _, _ = self.new_build("b1", BASE + 10, {"ScheduleManager.exe": "v"})
-        self.publish(package, manifest)
-        message = next(iter(self.mail.stored.values()))
-        self.assertTrue(message["subject"].startswith(updater.PACKAGE_TAG))
-        self.assertNotIn("update]", message["subject"].lower().replace("package", ""))
-        body = base64.urlsafe_b64decode(message["payload"]["parts"][0]["body"]["data"]).decode()
-        self.assertIn("SM-PACKAGE ", body)
-        self.assertNotIn("SM-UPDATE ", body)
-
-    def test_round_trip_needs_the_right_key(self):
+    def test_an_incomplete_download_is_refused(self):
         package, manifest, _, _ = self.new_build("b1", BASE + 10, {"ScheduleManager.exe": "v"})
         self.publish(package, manifest)
         update = self.check().available
-        self.assertEqual(update.enc, "aesgcm1")
-        self.assertEqual(updater.download(self.mail, update, public_key=self.public), package)
         with self.assertRaises(updater.UpdateError):
-            updater.download(self.mail, update)
-        updater.generate_keys(self.root / "other")
-        other = updater.load_public_key(self.root / "other" / updater.KEY_NAME)
-        with self.assertRaises(updater.UpdateError):
-            updater.download(self.mail, update, public_key=other)
+            updater.download(update, fetch=lambda url, progress=None: self.repo.fetch(url)[:-5])
 
-    def test_a_tampered_ciphertext_is_refused(self):
-        key = updater.transport_key(self.public)
-        sealed = updater.seal(b"payload bytes", key)
-        self.assertEqual(updater.unseal(sealed, key), b"payload bytes")
-        damaged = bytearray(sealed)
-        damaged[-1] ^= 1
-        with self.assertRaises(updater.UpdateError):
-            updater.unseal(bytes(damaged), key)
-        with self.assertRaises(updater.UpdateError):
-            updater.unseal(b"short", key)
-        with self.assertRaises(updater.UpdateError):
-            updater.unseal(b"not sealed at all, just long enough to pass the length check........", key)
-
-    def test_every_seal_is_different(self):
-        key = updater.transport_key(self.public)
-        self.assertNotEqual(updater.seal(b"same", key), updater.seal(b"same", key))
-
-    def test_old_installs_never_see_the_encrypted_messages(self):
-        package, manifest, _, _ = self.new_build("b1", BASE + 10, {"ScheduleManager.exe": "v"})
+    def test_progress_is_reported(self):
+        package, manifest, _, _ = self.new_build("b1", BASE + 10, {"_internal/data.json": os.urandom(4000)})
         self.publish(package, manifest)
-        old_query = self.mail.list(userId="me", q=f'from:me subject:"{updater.SUBJECT_TAG}" has:attachment').execute()
-        self.assertEqual(old_query["messages"], [])
+        seen = []
+        updater.download(self.check().available, lambda done, total: seen.append((done, total)), fetch=self.repo.fetch)
+        self.assertEqual(seen[-1][0], seen[-1][1])
 
-    def test_legacy_option_also_sends_the_old_plain_copy(self):
-        package, manifest, _, _ = self.new_build("b1", BASE + 10, {"ScheduleManager.exe": "v"}, notes="Both formats.")
-        self.assertEqual(updater.publish(self.mail, package, manifest, self.private, legacy=True), 2)
-        subjects = sorted(m["subject"].split(" 2.0")[0] for m in self.mail.stored.values())
-        self.assertEqual(subjects, [updater.PACKAGE_TAG, updater.SUBJECT_TAG])
-        old_query = self.mail.list(userId="me", q=f'from:me subject:"{updater.SUBJECT_TAG}" has:attachment').execute()
-        self.assertEqual(len(old_query["messages"]), 1)
-        legacy_id = old_query["messages"][0]["id"]
-        # what an install from before the change would do with the plain copy: read the attachment and check the hash
-        att_id = next(p["body"]["attachmentId"] for p in self.mail.stored[legacy_id]["payload"]["parts"] if p["filename"])
-        raw = base64.b64decode("".join(self.mail.attachment_data[(legacy_id, att_id)].decode().split()))
-        self.assertEqual(hashlib.sha256(raw).hexdigest(), manifest_sha(package))
-        # a current install prefers the encrypted copy of the same build
+    def test_publishing_to_a_missing_remote_reports_the_problem(self):
+        package, manifest, _, _ = self.new_build("b1", BASE + 10, {"ScheduleManager.exe": "v"})
+        with self.assertRaises(updater.UpdateError) as ctx:
+            updater.publish(package, manifest, self.private, str(self.root / "no-such-remote.git"))
+        self.assertIn("git push failed", str(ctx.exception))
+
+    def test_only_the_signed_package_is_trusted(self):
+        """Anyone can read or even overwrite the branch; without the signing key an update still won't install."""
+        updater.generate_keys(self.root / "evil")
+        evil = updater.load_private_key(self.root / "evil" / "update_signing_key.pem")
+        package, manifest, _, _ = self.new_build("b1", BASE + 10, {"ScheduleManager.exe": "malware"})
+        updater.publish(package, manifest, evil, self.repo.path)
         update = self.check().available
-        self.assertEqual(update.enc, "aesgcm1")
-        self.assertEqual(updater.download(self.mail, update, public_key=self.public), package)
+        with self.assertRaises(updater.UpdateError) as ctx:
+            updater.stage(self.download(update), update, updater.BuildInfo("2.0", BASE, BASE), self.public,
+                          self.device(), self.root / "stage")
+        self.assertIn("not signed", str(ctx.exception))
 
-    def test_the_plain_format_is_still_readable(self):
-        package, manifest, _, _ = self.new_build("b1", BASE + 10, {"ScheduleManager.exe": "v"})
-        sig = updater.sign(self.private, manifest["build"], manifest["base"], hashlib.sha256(package).hexdigest())
-        for mime in updater.build_messages(package, manifest, sig, "me@example.com"):
-            updater.send_mime(self.mail, mime)
-        update = self.check().available
-        self.assertEqual(update.enc, "")
-        self.assertEqual(updater.download(self.mail, update), package)
+    def test_the_real_http_download_code_reads_a_web_server(self):
+        import http.server
+        import threading
+        import urllib.error
+        payload = os.urandom(200_000)
 
-    def test_messages_in_the_trash_are_still_found(self):
-        package, manifest, _, _ = self.new_build("b1", BASE + 10, {"ScheduleManager.exe": "v"})
-        self.publish(package, manifest)
-        for message in self.mail.stored.values():
-            message["trashed"] = True
-        self.assertEqual(self.check().available.build, BASE + 10)
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path.startswith("/missing"):
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
 
-    def test_bounce_notices_from_gmail_are_ignored(self):
-        package, manifest, _, _ = self.new_build("b1", BASE + 10, {"ScheduleManager.exe": "v"})
-        self.publish(package, manifest)
-        self.mail.add_plain(f"Re: {updater.SUBJECT_TAG} 2.0 build {BASE + 10} (part 1 of 1)",
-                            "For security reasons, Gmail does not allow you to use this type of file.\n\nSM-UPDATE {broken",
-                            sender="Mail Delivery Subsystem <mailer-daemon@googlemail.com>")
-        self.assertEqual(self.check().available.build, BASE + 10)
+            def log_message(self, *a):
+                pass
 
-
-def manifest_sha(package: bytes) -> str:
-    return hashlib.sha256(package).hexdigest()
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            base = f"http://127.0.0.1:{server.server_address[1]}"
+            seen = []
+            self.assertEqual(updater.http_get(base + "/file", lambda d, t: seen.append((d, t))), payload)
+            self.assertEqual(seen[-1], (len(payload), len(payload)))
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                updater.http_get(base + "/missing")
+            self.assertEqual(ctx.exception.code, 404)
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 class StageTests(Case):
     def offered(self, changes, build=BASE + 10, notes="", removed=(), sign_with=None):
         package, manifest, ever, _ = self.new_build(f"b{build}", build, changes, notes=notes, removed=removed)
-        updater.publish(self.mail, package, manifest, sign_with or self.private)
+        updater.publish(package, manifest, sign_with or self.private, self.repo.path)
         update = self.check().available
         return package, update
 
@@ -413,7 +326,7 @@ class StageTests(Case):
         _, _, ever, tree1 = self.new_build("b1", BASE + 1, {"_internal/data.json": "data v2", "ScheduleManager.exe": "exe v2"})
         device = make_tree(self.root / "dev", {**INSTALLER, "_internal/data.json": "data v2", "ScheduleManager.exe": "exe v2"})
         package, manifest, _, tree2 = self.new_build("b2", BASE + 2, {"ScheduleManager.exe": "exe v3"}, ever=ever)
-        updater.publish(self.mail, package, manifest, self.private)
+        updater.publish(package, manifest, self.private, self.repo.path)
         update = self.check(build=BASE + 1).available
         staged = updater.stage(package, update, updater.BuildInfo("2.0", BASE + 1, BASE), self.public, device, self.root / "stage2")
         self.assertEqual(sorted(staged.manifest["included"]), ["ScheduleManager.exe", "_internal/data.json"])
@@ -425,7 +338,7 @@ class ApplyTests(Case):
 
     def staged_update(self, changes, removed=()):
         package, manifest, ever, _ = self.new_build("nb", BASE + 10, changes, removed=removed)
-        updater.publish(self.mail, package, manifest, self.private)
+        updater.publish(package, manifest, self.private, self.repo.path)
         update = self.check().available
         device = self.device()
         staged = updater.stage(package, update, updater.BuildInfo("2.0", BASE, BASE), self.public, device, self.root / "work" / "stage")

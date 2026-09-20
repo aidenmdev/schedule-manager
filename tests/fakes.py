@@ -306,100 +306,29 @@ class FakeGoogleAccount:
         return _Events()
 
 
-class FakeMailbox:
-    """A Gmail account that understands sending, listing, reading messages with attachments, and downloading them."""
+class LocalRepo:
+    """A bare git repository on disk that acts as the GitHub project: updater.publish pushes to it and its
+    fetch() answers the raw.githubusercontent.com URLs the app asks for."""
 
-    def __init__(self, address="me@example.com"):
-        self.address = address
-        self.stored = {}
-        self.attachment_data = {}
+    def __init__(self, path):
+        import subprocess
+        self.path = str(path)
+        subprocess.run(["git", "init", "-q", "--bare", self.path], check=True, capture_output=True)
         self.offline = False
-        self.sent_sizes = []
-        self.media_sends = 0
+        self.requests = []
 
-    def users(self):
-        return self
-
-    def getProfile(self, userId):
-        return Req(lambda: {"emailAddress": self.address})
-
-    def messages(self):
-        return self
-
-    def attachments(self):
-        return self.attachments_api()
-
-    def attachments_api(self):
-        mailbox = self
-
-        class _Attachments:
-            def get(self, userId, messageId, id):
-                def go():
-                    mailbox._check()
-                    return {"data": base64.urlsafe_b64encode(mailbox.attachment_data[(messageId, id)]).decode("ascii"),
-                            "size": len(mailbox.attachment_data[(messageId, id)])}
-                return Req(go)
-        return _Attachments()
-
-    def _check(self):
+    def fetch(self, url, progress=None):
+        import io
+        import subprocess
+        import urllib.error
+        self.requests.append(url)
         if self.offline:
-            raise OSError("[Errno 11001] getaddrinfo failed")
-
-    def send(self, userId, body=None, media_body=None):
-        import email
-        from email import policy
-
-        def go():
-            self._check()
-            if media_body is not None:
-                raw = media_body.getbytes(0, media_body.size())
-                self.media_sends += 1
-            else:
-                raw = base64.urlsafe_b64decode(body["raw"])
-            self.sent_sizes.append(len(raw))
-            msg = email.message_from_bytes(raw, policy=policy.default)
-            mid = f"m{len(self.stored) + 1}"
-            parts = []
-            for i, part in enumerate(msg.walk()):
-                if part.is_multipart():
-                    continue
-                payload = part.get_payload(decode=True)
-                name = part.get_filename()
-                if name:
-                    att_id = f"att-{mid}-{i}"
-                    self.attachment_data[(mid, att_id)] = payload
-                    parts.append({"mimeType": part.get_content_type(), "filename": name,
-                                  "body": {"attachmentId": att_id, "size": len(payload)}})
-                else:
-                    parts.append({"mimeType": part.get_content_type(), "filename": "",
-                                  "body": {"data": base64.urlsafe_b64encode(payload).decode("ascii")}})
-            self.stored[mid] = {"id": mid, "from": self.address, "subject": msg["Subject"],
-                                "payload": {"mimeType": "multipart/mixed", "parts": parts}}
-            return {"id": mid}
-        return Req(go)
-
-    def add_plain(self, subject, text, sender=None):
-        mid = f"m{len(self.stored) + 1}"
-        self.stored[mid] = {"id": mid, "from": sender or self.address, "subject": subject, "payload": {
-            "mimeType": "text/plain", "body": {"data": base64.urlsafe_b64encode(text.encode()).decode("ascii")}}}
-        return mid
-
-    def list(self, userId, q="", maxResults=50, pageToken=None, **kw):
-        def go():
-            self._check()
-            import re as _re
-            phrases = _re.findall(r'subject:"([^"]+)"', q or "")
-            hits = [m for m in self.stored.values()
-                    if (not phrases or any(ph in m["subject"] for ph in phrases))
-                    and (kw.get("includeSpamTrash") or not m.get("trashed"))
-                    and ("from:me" not in (q or "") or m["from"] == self.address)
-                    and ("has:attachment" not in (q or "") or any(p.get("filename") for p in m["payload"].get("parts", [])))]
-            return {"messages": [{"id": m["id"]} for m in reversed(hits)][:maxResults]}
-        return Req(go)
-
-    def get(self, userId, id, format="full"):
-        def go():
-            self._check()
-            m = self.stored[id]
-            return {"id": id, "payload": m["payload"]}
-        return Req(go)
+            raise urllib.error.URLError(OSError("[Errno 11001] getaddrinfo failed"))
+        parts = url.split("?")[0].split("/")
+        branch, name = parts[-2], parts[-1]
+        result = subprocess.run(["git", "--git-dir", self.path, "show", f"{branch}:{name}"], capture_output=True)
+        if result.returncode != 0:
+            raise urllib.error.HTTPError(url, 404, "Not Found", {}, io.BytesIO())
+        if progress:
+            progress(len(result.stdout), len(result.stdout))
+        return result.stdout

@@ -774,9 +774,6 @@ class App(ctk.CTk):
         self.maybe_check_updates()
         self.after(self.SYNC_EVERY_MS, self._periodic_sync)
 
-    def _update_service(self):
-        return core.build_services()[0]
-
     def _install_dir(self) -> Path:
         return Path(sys.executable).parent
 
@@ -808,7 +805,7 @@ class App(ctk.CTk):
         self._update_label()
 
         def work():
-            return updater.find_updates(self._update_service(), info)
+            return updater.find_updates(info)
 
         def done(check):
             self._update_running = False
@@ -868,7 +865,7 @@ class App(ctk.CTk):
 
         def work():
             key = updater.load_public_key(core.RESOURCE_DIR / updater.KEY_NAME)
-            package = updater.download(self._update_service(), update, public_key=key)
+            package = updater.download(update)
             shutil.rmtree(work_dir, ignore_errors=True)
             return updater.stage(package, update, info, key, install_dir, work_dir / "stage")
 
@@ -3383,7 +3380,7 @@ class HelpPage(Page):
                                  f"Version {core.APP_VERSION}. This copy runs from the source folder, so it doesn't update itself.",
                                  14, "bold", anchor="w")
         self.version_lbl.grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
-        label(b, "New versions are published from the computer where the code is changed and arrive through your own Gmail. "
+        label(b, "New versions are published from the computer where the code is changed and downloaded from your GitHub project. "
                  "Nothing is installed without you saying so.", 12, color=C["muted"], wraplength=820, justify="left",
               anchor="w").grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 10))
         self.update_auto = switch(b, text="Look for updates automatically", command=self._toggle_update_auto)

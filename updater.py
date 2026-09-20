@@ -1,7 +1,8 @@
 """Updates for the installed app.
 
-The computer you build on emails each update to your own Gmail (installer/publish.py). The app on your
-other computers finds that message, checks that it was signed by your build computer, and installs it.
+The computer you build on publishes each update to a branch of your GitHub repository (installer/publish.py).
+The app on your other computers reads it from there, checks that it was signed by your build computer, and
+installs it. Only the signature is trusted, so it doesn't matter who else can read the branch.
 """
 from __future__ import annotations
 
@@ -10,28 +11,25 @@ import hashlib
 import io
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.request
 import zipfile
-from dataclasses import dataclass, field
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
 import dominos_schedule as core
 
-SUBJECT_TAG = "[Schedule Manager update]"
-PART_BYTES = 9 * 1024 * 1024   # each email carries at most this much, before encoding
+DEFAULT_REPO = "aidenmdev/schedule-manager"
+BRANCH = "updates"
+META_NAME = "update.json"
+PACKAGE_NAME = "package.bin"
 BUILD_INFO_NAME = "build_info.json"
 KEY_NAME = "update_key.pub"
 NEVER_SHIPPED = frozenset({"credentials.json"})   # stays as installed on each computer
-PACKAGE_TAG = "[Schedule Manager package]"   # current format: encrypted, so Gmail's scanner has nothing to object to
-MACHINE_LINE = re.compile(r"SM-UPDATE (\{.*\})")      # the first format: a plain zip, which Gmail refuses to deliver
-PACKAGE_LINE = re.compile(r"SM-PACKAGE (\{.*\})")
-SEAL_MAGIC = b"SMP1"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
@@ -44,12 +42,13 @@ class BuildInfo:
     version: str
     build: int
     base: int   # which installer this build descends from; updates only apply within the same base
+    repo: str = DEFAULT_REPO
 
 
 def read_build_info(resource_dir: Optional[Path] = None) -> Optional[BuildInfo]:
     try:
         raw = json.loads((Path(resource_dir or core.RESOURCE_DIR) / BUILD_INFO_NAME).read_text(encoding="utf-8"))
-        return BuildInfo(str(raw["version"]), int(raw["build"]), int(raw["base"]))
+        return BuildInfo(str(raw["version"]), int(raw["build"]), int(raw["base"]), str(raw.get("repo") or DEFAULT_REPO))
     except (OSError, ValueError, KeyError, TypeError):
         return None
 
@@ -143,100 +142,23 @@ def build_package(root: Path, baseline: dict, info: BuildInfo, notes: str, ever_
     return buf.getvalue(), manifest, set(ever_changed) | included
 
 
-def split_parts(data: bytes, size: int = 0) -> list:
-    size = size or PART_BYTES
-    return [data[i:i + size] for i in range(0, len(data), size)] or [b""]
+def raw_url(repo: str, name: str, branch: str = BRANCH) -> str:
+    return f"https://raw.githubusercontent.com/{repo}/{branch}/{name}"
 
 
-def _wrapped_b64(data: bytes) -> str:
-    text = base64.b64encode(data).decode("ascii")
-    return "\n".join(text[i:i + 76] for i in range(0, len(text), 76)) + "\n"
+def http_get(url: str, progress: Optional[Callable[[int, int], None]] = None, timeout: int = 40) -> bytes:
+    """Download a URL. Raises OSError-based errors when offline, which the app treats as 'no connection'."""
+    request = urllib.request.Request(url, headers={"User-Agent": "ScheduleManager-updater"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        total = int(response.headers.get("Content-Length") or 0)
+        chunks, done = [], 0
+        for block in iter(lambda: response.read(1 << 16), b""):
+            chunks.append(block)
+            done += len(block)
+            if progress and total:
+                progress(done, total)
+    return b"".join(chunks)
 
-
-def transport_key(public_key) -> bytes:
-    """Both ends know the public key, so both can derive this. It only hides the package from mail scanners
-    (Gmail refuses to deliver a message whose attachment is a zip containing a program); the signature is what
-    protects you."""
-    from cryptography.hazmat.primitives import serialization
-    raw = public_key.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-    return hashlib.sha256(b"schedule-manager-transport|" + raw).digest()
-
-
-def seal(package: bytes, key: bytes) -> bytes:
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    nonce = os.urandom(12)
-    return SEAL_MAGIC + nonce + AESGCM(key).encrypt(nonce, package, SEAL_MAGIC)
-
-
-def unseal(data: bytes, key: bytes) -> bytes:
-    from cryptography.exceptions import InvalidTag
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    if not data.startswith(SEAL_MAGIC) or len(data) < len(SEAL_MAGIC) + 12 + 16:
-        raise UpdateError("The download is incomplete or damaged. Try again.")
-    nonce = data[len(SEAL_MAGIC):len(SEAL_MAGIC) + 12]
-    try:
-        return AESGCM(key).decrypt(nonce, data[len(SEAL_MAGIC) + 12:], SEAL_MAGIC)
-    except InvalidTag as e:
-        raise UpdateError("The download is damaged, or wasn't made by your build computer.") from e
-
-
-def build_messages(package: bytes, manifest: dict, signature: str, to_addr: str, key: Optional[bytes] = None) -> list:
-    """The emails that carry an update, as raw MIME bytes. With a `key` the package is encrypted (the normal way);
-    without one it goes as a plain zip, which older installs understand but Gmail complains about."""
-    sha = hashlib.sha256(package).hexdigest()
-    wire = seal(package, key) if key else package
-    parts = split_parts(wire)
-    tag, line = (PACKAGE_TAG, "SM-PACKAGE") if key else (SUBJECT_TAG, "SM-UPDATE")
-    messages = []
-    for index, chunk in enumerate(parts, start=1):
-        meta = {"version": manifest["version"], "build": manifest["build"], "base": manifest["base"], "sha256": sha,
-                "size": len(package), "sig": signature, "part": index, "parts": len(parts)}
-        if key:
-            meta["enc"] = "aesgcm1"
-        msg = MIMEMultipart()
-        msg["To"] = to_addr
-        msg["Subject"] = f"{tag} {manifest['version']} build {manifest['build']} (part {index} of {len(parts)})"
-        body = (f"Schedule Manager {manifest['version']}\n\n{manifest.get('notes') or 'No notes.'}\n\n---\n"
-                "Your other computers use this message to update themselves. You can ignore it or file it away, "
-                f"but please don't delete it until they have updated.\n\n{line} " + json.dumps(meta, separators=(",", ":")) + "\n")
-        msg.attach(MIMEText(body, "plain", "utf-8"))
-        attachment = MIMEText(_wrapped_b64(chunk), "plain", "us-ascii")
-        attachment.add_header("Content-Disposition", "attachment",
-                              filename=f"{'package' if key else 'update'}-{manifest['build']}-part{index}.txt")
-        msg.attach(attachment)
-        messages.append(msg.as_bytes())
-    return messages
-
-
-def send_mime(gmail, mime: bytes) -> None:
-    """Small messages go as JSON; big ones use Gmail's upload endpoint, which allows up to 35 MB."""
-    if len(mime) < 2 * 1024 * 1024:
-        gmail.users().messages().send(userId="me", body={"raw": base64.urlsafe_b64encode(mime).decode("ascii")}).execute(
-            num_retries=core.RETRIES)
-        return
-    from googleapiclient.http import MediaIoBaseUpload
-    media = MediaIoBaseUpload(io.BytesIO(mime), mimetype="message/rfc822", resumable=False)
-    gmail.users().messages().send(userId="me", media_body=media).execute(num_retries=core.RETRIES)
-
-
-def publish(gmail, package: bytes, manifest: dict, private_key, to_addr: Optional[str] = None,
-            progress: Optional[Callable[[int, int], None]] = None, legacy: bool = False) -> int:
-    """Email the update to yourself. `legacy` also sends the old plain-zip copy for installs that predate the
-    encrypted format (Gmail will bounce that copy back to you, but the sent copy is still readable). Returns messages sent."""
-    to_addr = to_addr or gmail.users().getProfile(userId="me").execute()["emailAddress"]
-    sha = hashlib.sha256(package).hexdigest()
-    signature = sign(private_key, manifest["build"], manifest["base"], sha)
-    messages = build_messages(package, manifest, signature, to_addr, transport_key(private_key.public_key()))
-    if legacy:
-        messages += build_messages(package, manifest, signature, to_addr)
-    for i, mime in enumerate(messages, start=1):
-        send_mime(gmail, mime)
-        if progress:
-            progress(i, len(messages))
-    return len(messages)
-
-
-# ---- finding and downloading ----------------------------------------------------------------------------
 
 @dataclass
 class Update:
@@ -247,13 +169,7 @@ class Update:
     sha256: str
     signature: str
     size: int
-    total_parts: int
-    parts: dict = field(default_factory=dict)   # part number -> (message id, attachment id)
-    enc: str = ""                               # "" = plain zip, otherwise how the package is sealed
-
-    @property
-    def complete(self) -> bool:
-        return sorted(self.parts) == list(range(1, self.total_parts + 1))
+    url: str
 
 
 @dataclass
@@ -263,95 +179,66 @@ class UpdateCheck:
     needs_new_installer: Optional[Update] = None   # a newer build exists, but it was made from a different installer
 
 
-def _walk_parts(payload: dict):
-    yield payload
-    for child in payload.get("parts", []) or []:
-        yield from _walk_parts(child)
-
-
-def _decode_b64url(data: str) -> bytes:
-    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
-
-
-def _read_message(message: dict) -> Optional[tuple]:
-    """(meta dict, notes, attachment id) for a message that looks like an update part, else None."""
-    body_text, attachment_id = "", None
-    for part in _walk_parts(message.get("payload", {})):
-        body = part.get("body", {}) or {}
-        if part.get("filename"):
-            attachment_id = body.get("attachmentId")
-        elif part.get("mimeType") == "text/plain" and body.get("data"):
-            body_text += _decode_b64url(body["data"]).decode("utf-8", errors="replace")
-    found = PACKAGE_LINE.search(body_text) or MACHINE_LINE.search(body_text)
-    if not found or not attachment_id:
-        return None
+def parse_meta(raw: bytes, repo: str, branch: str = BRANCH) -> Update:
     try:
-        meta = json.loads(found.group(1))
-        int(meta["build"]), int(meta["base"]), int(meta["part"]), int(meta["parts"])
-        meta["sha256"], meta["sig"], meta["version"]
-    except (ValueError, KeyError, TypeError):
-        return None
-    head = body_text.split("\n\n---\n")[0].split("\n\n", 1)
-    return meta, (head[1].strip() if len(head) > 1 else ""), attachment_id
+        meta = json.loads(raw.decode("utf-8"))
+        return Update(str(meta["version"]), int(meta["build"]), int(meta["base"]), str(meta.get("notes") or ""),
+                      str(meta["sha256"]), str(meta["sig"]), int(meta.get("size") or 0),
+                      raw_url(repo, str(meta.get("file") or PACKAGE_NAME), branch))
+    except (ValueError, KeyError, TypeError, UnicodeDecodeError) as e:
+        raise UpdateError("The update information on GitHub is unreadable.") from e
 
 
-def find_updates(gmail, current: BuildInfo, limit: int = 60) -> UpdateCheck:
-    """Look through your own mail (sent copies and the trash included) for update messages newer than this build."""
-    query = ('from:me (subject:"Schedule Manager package" OR subject:"Schedule Manager update") has:attachment')
-    ids = []
-    token = None
-    while len(ids) < limit:
-        resp = gmail.users().messages().list(userId="me", q=query, maxResults=min(50, limit), pageToken=token,
-                                             includeSpamTrash=True).execute(num_retries=core.RETRIES)
-        ids += [m["id"] for m in resp.get("messages", [])]
-        token = resp.get("nextPageToken")
-        if not token:
-            break
-    updates: dict = {}
-    for mid in ids[:limit]:
-        message = gmail.users().messages().get(userId="me", id=mid, format="full").execute(num_retries=core.RETRIES)
-        read = _read_message(message)
-        if read is None:
-            continue
-        meta, notes, attachment_id = read
-        enc = str(meta.get("enc", ""))
-        key = (int(meta["build"]), int(meta["base"]), meta["sha256"], enc)
-        update = updates.setdefault(key, Update(str(meta["version"]), int(meta["build"]), int(meta["base"]), notes,
-                                                meta["sha256"], meta["sig"], int(meta.get("size", 0)), int(meta["parts"]),
-                                                enc=enc))
-        update.parts[int(meta["part"])] = (mid, attachment_id)
+def find_updates(current: BuildInfo, fetch: Optional[Callable] = None, branch: str = BRANCH) -> UpdateCheck:
+    """Look at the latest published update and say whether it is newer than this build."""
+    fetch = fetch or http_get
+    try:
+        raw = fetch(raw_url(current.repo, META_NAME, branch) + f"?t={int(time.time())}")  # the query skips GitHub's cache
+    except OSError as e:
+        if getattr(e, "code", None) == 404:   # nothing has been published yet
+            return UpdateCheck(current)
+        raise
+    update = parse_meta(raw, current.repo, branch)
     check = UpdateCheck(current)
-    for update in sorted(updates.values(), key=lambda u: (u.build, u.enc != ""), reverse=True):
-        if update.build <= current.build or not update.complete or update.enc not in ("", "aesgcm1"):
-            continue
+    if update.build > current.build:
         if update.base == current.base:
             check.available = update
-            break
-        if check.needs_new_installer is None:
+        else:
             check.needs_new_installer = update
     return check
 
 
-def download(gmail, update: Update, progress: Optional[Callable[[int, int], None]] = None, public_key=None) -> bytes:
-    """The update package. Encrypted updates need `public_key` (the one shipped inside the app)."""
-    chunks = []
-    for number in sorted(update.parts):
-        message_id, attachment_id = update.parts[number]
-        att = gmail.users().messages().attachments().get(userId="me", messageId=message_id, id=attachment_id).execute(
-            num_retries=core.RETRIES)
-        text = _decode_b64url(att["data"]).decode("ascii", errors="replace")
-        try:
-            chunks.append(base64.b64decode("".join(text.split()), validate=True))
-        except ValueError as e:
-            raise UpdateError("The update message is damaged. Ask the build computer to publish it again.") from e
-        if progress:
-            progress(number, update.total_parts)
-    data = b"".join(chunks)
-    if update.enc:
-        if public_key is None:
-            raise UpdateError("This update is encrypted and no key was available to open it.")
-        data = unseal(data, transport_key(public_key))
+def download(update: Update, progress: Optional[Callable[[int, int], None]] = None, fetch: Optional[Callable] = None) -> bytes:
+    fetch = fetch or http_get
+    data = fetch(update.url, progress)
+    if update.size and len(data) != update.size:
+        raise UpdateError("The download is incomplete. Try again.")
     return data
+
+
+def publish(package: bytes, manifest: dict, private_key, remote: str, branch: str = BRANCH) -> None:
+    """Replace the published update with this one: a single-commit branch holding update.json and package.bin.
+    Uses the git already installed and signed in on this computer."""
+    sha = hashlib.sha256(package).hexdigest()
+    meta = {"version": manifest["version"], "build": manifest["build"], "base": manifest["base"],
+            "notes": manifest.get("notes") or "", "sha256": sha, "size": len(package), "file": PACKAGE_NAME,
+            "sig": sign(private_key, manifest["build"], manifest["base"], sha)}
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+
+    def git(*args, cwd):
+        result = subprocess.run(["git", *args], cwd=cwd, env=env, capture_output=True, text=True, creationflags=NO_WINDOW)
+        if result.returncode != 0:
+            raise UpdateError(f"git {args[0]} failed: {(result.stderr or result.stdout).strip()[:400]}")
+
+    with tempfile.TemporaryDirectory() as work:
+        Path(work, META_NAME).write_text(json.dumps(meta, indent=1), encoding="utf-8")
+        Path(work, PACKAGE_NAME).write_bytes(package)
+        git("init", "-q", cwd=work)
+        git("checkout", "-q", "--orphan", branch, cwd=work)
+        git("add", "-A", cwd=work)
+        git("-c", "user.name=Schedule Manager", "-c", "user.email=updates@users.noreply.github.com", "commit", "-q",
+            "-m", f"Update {manifest['version']} build {manifest['build']}", cwd=work)
+        git("push", "--force", remote, f"{branch}:{branch}", cwd=work)
 
 
 # ---- checking and staging ---------------------------------------------------------------------------------
