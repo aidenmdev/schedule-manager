@@ -1,0 +1,10 @@
+{
+ "version": "2.0",
+ "build": 20260923145626,
+ "base": 20260919192709,
+ "notes": "Dominos calendar events now show the shift length in the title (e.g. \"Dominos 3.5hr\") and no longer include the store phone number. Fixed the window not opening maximized.",
+ "sha256": "10f9cac48a7412aa540ff649ae4600b98230dec480361e0c1d65a9866cc1cdd8",
+ "size": 8217480,
+ "file": "package.bin",
+ "sig": "/Tj4vA8+IaHlM9kh5BeI5MxnJ4ASdcE84/qKLn/3Nvv13X8YWRH/NnpUsR2xHX0I0Bmx1zQyeB8lrkwMnnkNCw=="
+}
