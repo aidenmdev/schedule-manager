@@ -539,6 +539,13 @@ class App(ctk.CTk):
         self._load_config()
         self._build_ui()
         self.show_page("home")
+        if not hidden_mode():
+            # CustomTkinter only sets the dark titlebar the first time update()/mainloop() runs, and does that by
+            # withdrawing and re-showing the window - which silently drops the "zoomed" state set in
+            # _open_maximized() above, since that happens before this window is considered to "exist". Rendering
+            # once here (full UI already built, so nothing half-built flashes) marks it as existing before
+            # App().mainloop() gets to run that dance, so the maximized state survives.
+            self.update()
         self.after(1500, self._prebuild_pages)
         self.bind("<F5>", lambda _e: self.pages[self.current].refresh())
         self.bind("<F11>", lambda _e: self.attributes("-fullscreen", not self.attributes("-fullscreen")))
@@ -3142,7 +3149,8 @@ class SettingsPage(Page):
         self._field(b, 2, "report_calendars", "Read reports from", ", ".join(cfg.get("report_calendars", [])),
                     hint="Comma separated calendar IDs")
         self._field(b, 3, "timezone", "Timezone", cfg["timezone"])
-        self._field(b, 4, "event_title", "Dominos event title", cfg["event_title"])
+        self._field(b, 4, "event_title", "Dominos event title", cfg["event_title"],
+                    hint="The shift length is added automatically, e.g. \"Dominos 3.5hr\".")
         self._field(b, 5, "store_name", "Store name", cfg.get("store_name", ""))
         self._field(b, 6, "reminder_minutes_before", "Reminders (minutes before)",
                     ", ".join(str(m) for m in core.reminder_list(cfg)), width=160,

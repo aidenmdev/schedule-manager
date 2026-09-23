@@ -618,14 +618,25 @@ def send_email(gmail, to: str, subject: str, body_text: str, html_body: Optional
     return sent["id"]
 
 
+def event_title_for_shift(config: dict, hours: float) -> str:
+    """The calendar title for a shift: the configured name plus its length, e.g. 'Dominos 3.5hr'."""
+    base = (config.get("event_title") or "Dominos").strip()
+    return f"{base} {hours:g}hr"
+
+
+def shift_title_pattern(config: dict):
+    """Matches a calendar title created by `event_title_for_shift` for this config, whatever the shift length."""
+    base = re.escape((config.get("event_title") or "Dominos").strip())
+    return re.compile(rf"^{base}\s+[\d.]+\s*hr$", re.IGNORECASE)
+
+
 def create_calendar_event(calendar, config: dict, parsed: ParsedSchedule, shift: Shift) -> dict:
     color_id = (config.get("event_color_id") or {}).get(shift.role)
     store_name = config.get("store_name") or "Domino's"
     body = {
-        "summary": config["event_title"],
+        "summary": event_title_for_shift(config, shift.hours),
         "description": (
             f"{shift.role} shift at {store_name}"
-            + (f"\nStore phone: {parsed.phone}" if parsed.phone else "")
             + f"\nImported by Schedule Manager on {datetime.now():%m/%d/%Y %I:%M %p}"
             + f"\nSource email ID: {parsed.email_id}"
         ),
@@ -1636,9 +1647,9 @@ def generate_weekly_report(calendar, config: dict, week_start: date, week_end: d
 
 def existing_shift_slots(calendar, config: dict, week_start: date, week_end: date) -> set:
     """(start, end) of every event already on the calendar titled like a Dominos shift, for duplicate protection."""
-    title = (config.get("event_title") or "Dominos").strip().lower()
+    pattern = shift_title_pattern(config)
     events = fetch_week_events(calendar, config, week_start - timedelta(days=1), week_end + timedelta(days=1))
-    return {(e["start"], e["end"]) for e in events if not e["all_day"] and e["summary"].strip().lower() == title}
+    return {(e["start"], e["end"]) for e in events if not e["all_day"] and pattern.match(e["summary"].strip())}
 
 
 def diff_schedule(state: StateStore, parsed: ParsedSchedule, existing_slots: frozenset = frozenset()) -> dict:
@@ -1666,11 +1677,11 @@ def schedule_status(state: StateStore, parsed: ParsedSchedule) -> str:
 def analyze_import(calendar, config: dict, state: StateStore, parsed: ParsedSchedule) -> dict:
     """Preview of importing `parsed`: what is new / already there / dropped, and which conflicts the new shifts would create with everything else on the calendar. Read-only."""
     events, stale_at = fetch_events_or_cached(calendar, config, parsed.week_start, parsed.week_end)
-    title = (config.get("event_title") or "Dominos").strip().lower()
-    slots = frozenset((e["start"], e["end"]) for e in events if not e["all_day"] and e["summary"].strip().lower() == title)
+    pattern = shift_title_pattern(config)
+    slots = frozenset((e["start"], e["end"]) for e in events if not e["all_day"] and pattern.match(e["summary"].strip()))
     diff = diff_schedule(state, parsed, slots)
     synthetic = [
-        {"id": f"new:{i}", "summary": config.get("event_title") or "Dominos", "start": s.start_dt, "end": s.end_dt,
+        {"id": f"new:{i}", "summary": event_title_for_shift(config, s.hours), "start": s.start_dt, "end": s.end_dt,
          "all_day": False, "day": s.shift_date, "category": "Dominos", "calendar_id": config["calendar_id"]}
         for i, s in enumerate(diff["new"])
     ]
@@ -1816,7 +1827,8 @@ def cmd_import(args):
 
     if args.dry_run:
         if new_count:
-            print(f"\n[dry run] Would create {new_count} calendar event(s) titled \"{config['event_title']}\"")
+            example = event_title_for_shift(config, diff["new"][0].hours)
+            print(f"\n[dry run] Would create {new_count} calendar event(s) titled like \"{example}\"")
         if not args.no_email:
             print("[dry run] Would build and send the full weekly report email.")
         return

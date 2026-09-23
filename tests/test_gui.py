@@ -726,6 +726,12 @@ class GuiTests(unittest.TestCase):
                 return ex1, y1, ex2, y2, ev
         self.fail(f"no block for {title}")
 
+    def _block_by_category(self, gv, category, weekday=None):
+        for ex1, y1, ex2, y2, ev in gv._blocks:
+            if ev["category"] == category and (weekday is None or ev["day"].weekday() == weekday):
+                return ex1, y1, ex2, y2, ev
+        self.fail(f"no block for category {category}")
+
     def _open_week(self, weeks_ahead=0):
         wp = self.app.pages["week"]
         wp.week_start = self.env.mon + timedelta(weeks=weeks_ahead)
@@ -827,7 +833,7 @@ class GuiTests(unittest.TestCase):
         core.perform_import(self.env.gmail, self.env.cal, self.env.cfg, state, old, send_report=False, log=lambda *_: None)
         self.app.reload_store()
         wp, gv = self._open_week(weeks_ahead=1)
-        ex1, y1, ex2, y2, ev = self._block(gv, "Dominos")
+        ex1, y1, ex2, y2, ev = self._block_by_category(gv, "Dominos")
         before = self._start_of(ev["id"])
         cx = (ex1 + ex2) / 2
         hour_h = gv._geo["hour_h"]
@@ -836,7 +842,7 @@ class GuiTests(unittest.TestCase):
             self.pump(1.5)
         self.assertEqual(self._start_of(ev["id"]), before)          # declined: unchanged
         wp, gv = self._open_week(weeks_ahead=1)
-        ex1, y1, ex2, y2, ev = self._block(gv, "Dominos")
+        ex1, y1, ex2, y2, ev = self._block_by_category(gv, "Dominos")
         with auto_modal(self.g, "Move"):
             self._drag(gv, (ex1 + ex2) / 2, y1 + 12, (ex1 + ex2) / 2, y1 + 12 + hour_h)
             self.pump(2.0)

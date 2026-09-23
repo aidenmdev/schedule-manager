@@ -393,7 +393,7 @@ class ImportFlowTests(unittest.TestCase):
         # persisted to disk
         self.assertEqual(len(core.StateStore(self.state.path).data["imported_shift_keys"]), 6)
         ev0 = next(iter(self.cal.events_by_id.values()))
-        self.assertEqual(ev0["summary"], "Dominos")
+        self.assertEqual(ev0["summary"], core.event_title_for_shift(self.cfg, self.parsed.shifts[0].hours))
         self.assertEqual([o["minutes"] for o in ev0["reminders"]["overrides"]], [60, 30])
 
     def test_reimport_is_idempotent(self):
@@ -405,7 +405,7 @@ class ImportFlowTests(unittest.TestCase):
     def test_existing_calendar_events_not_duplicated(self):
         # events from an older script / manual entry, not tracked in state
         for s in self.parsed.shifts[:3]:
-            self.cal.add_raw("Dominos", s.start_dt, s.end_dt)
+            self.cal.add_raw(core.event_title_for_shift(self.cfg, s.hours), s.start_dt, s.end_dt)
         r = self.run_import()
         self.assertEqual((len(r["created_events"]), r["on_calendar"]), (3, 3))
         self.assertEqual(len(self.cal.events_by_id), 6)
@@ -538,7 +538,7 @@ class ImportFlowTests(unittest.TestCase):
         entry = self.state.week_entry("2026-09-21")
         eid, key = entry["event_ids"][1], entry["shift_keys"][1]
         snap = core.delete_event_with_snapshot(self.cal, "primary", eid)
-        self.assertEqual(snap["summary"], "Dominos")
+        self.assertEqual(snap["summary"], core.event_title_for_shift(self.cfg, self.parsed.shifts[1].hours))
         self.assertNotIn("id", snap)
         self.assertNotIn(eid, self.cal.events_by_id)
         info = core.forget_event(self.state, eid)
@@ -616,7 +616,7 @@ class AnalyzeTests(unittest.TestCase):
 
     def test_already_on_calendar_not_counted_as_new(self):
         for s in self.parsed.shifts[:2]:
-            self.cal.add_raw("Dominos", s.start_dt, s.end_dt)
+            self.cal.add_raw(core.event_title_for_shift(self.cfg, s.hours), s.start_dt, s.end_dt)
         a = core.analyze_import(self.cal, self.cfg, self.state, self.parsed)
         self.assertEqual((len(a["diff"]["new"]), len(a["diff"]["already"])), (4, 2))
 
