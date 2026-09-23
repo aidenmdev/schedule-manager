@@ -1,5 +1,7 @@
 # Schedule Manager
 
+A personal project, vibecoded with an AI coding assistant (Claude) - a tool I built for tracking and updating my own work schedule.
+
 A Windows desktop app that turns a work-schedule email into calendar events and keeps an eye on the rest of your week.
 
 It reads schedule emails from Gmail (written for Domino's "your schedule is..." emails), adds the shifts to Google Calendar, and emails you a weekly summary that covers everything on your calendar: jobs, classes, appointments, and any conflicts between them.
